@@ -72,6 +72,14 @@ class TrainConfig:
     patience: int = 15
     degree_corr_lambda: float = 0.1
 
+    # BPR loss configuration
+    bpr_weight: float = 1.0          # Weight for BPR ranking loss
+    bce_weight: float = 0.3          # Weight for BCE calibration loss (lower since BPR is primary)
+    bpr_neg_per_pos: int = 5         # Negative drugs sampled per positive for BPR pairs
+    hard_neg_fraction: float = 0.5   # Fraction of BPR negatives that are hard (model-scored)
+    hard_neg_start_epoch: int = 20   # Start hard negatives after this many epochs (warmup)
+    hard_neg_refresh: int = 10       # Re-mine hard negatives every N epochs
+
     ranking_k: int = 10
     spearman_diseases: int = 30
     diversity_max_diseases: int = 30
@@ -104,6 +112,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--bpr-weight", type=float, default=1.0, help="BPR ranking loss weight")
+    parser.add_argument("--bce-weight", type=float, default=0.3, help="BCE calibration loss weight")
     parser.add_argument("--run-tsne", action="store_true", help="Enable t-SNE plot (uses extra memory)")
     args = parser.parse_args()
 
@@ -116,6 +126,8 @@ def parse_args() -> TrainConfig:
         hidden_dim=args.hidden_dim,
         embedding_dim=args.embedding_dim,
         eval_every=args.eval_every,
+        bpr_weight=args.bpr_weight,
+        bce_weight=args.bce_weight,
         skip_tsne=not args.run_tsne,
     )
     config.dataset_path = config.data_dir / "primekg.csv"
@@ -587,6 +599,138 @@ def degree_correlation_regularizer(
     denom = torch.sqrt(scores_centered.pow(2).mean() * degree_centered.pow(2).mean() + 1e-8)
     corr = (scores_centered * degree_centered).mean() / denom
     return corr.abs()
+
+
+# ─── BPR Loss & Hard Negative Mining ─────────────────────────────────
+
+def bpr_loss(
+    pos_scores: torch.Tensor,
+    neg_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Bayesian Personalized Ranking loss.
+
+    Optimizes: score(positive_drug) > score(negative_drug) for same disease.
+    Loss = -log(sigmoid(pos_score - neg_score)), averaged.
+    """
+    return -F.logsigmoid(pos_scores - neg_scores).mean()
+
+
+def build_bpr_pairs(
+    pos_edges: List[Tuple[int, int]],
+    neg_edges: List[Tuple[int, int]],
+    neg_per_pos: int,
+    rng: np.random.Generator,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build BPR training pairs: for each positive (drug, disease),
+    sample neg_per_pos negative drugs for the SAME disease.
+
+    Returns:
+        pos_pairs: [2, N] tensor of (drug_pos, disease)
+        neg_pairs: [2, N] tensor of (drug_neg, disease)  (same disease per row)
+    """
+    # Group negatives by disease for efficient lookup
+    disease_to_neg_drugs: Dict[int, List[int]] = defaultdict(list)
+    for drug_idx, disease_idx in neg_edges:
+        disease_to_neg_drugs[disease_idx].append(drug_idx)
+
+    # For diseases with no pre-sampled negatives, build a global fallback pool
+    all_neg_drugs = list(set(drug for drug, _ in neg_edges))
+
+    bpr_pos_list = []
+    bpr_neg_list = []
+
+    for drug_pos, disease_idx in pos_edges:
+        neg_pool = disease_to_neg_drugs.get(disease_idx, all_neg_drugs)
+        n_sample = min(neg_per_pos, len(neg_pool))
+        if n_sample == 0:
+            continue
+
+        chosen_neg_drugs = rng.choice(neg_pool, size=n_sample, replace=len(neg_pool) < n_sample)
+        for drug_neg in chosen_neg_drugs:
+            bpr_pos_list.append((drug_pos, disease_idx))
+            bpr_neg_list.append((int(drug_neg), disease_idx))
+
+    pos_pairs = torch.tensor(bpr_pos_list, dtype=torch.long).T  # [2, N]
+    neg_pairs = torch.tensor(bpr_neg_list, dtype=torch.long).T  # [2, N]
+    return pos_pairs, neg_pairs
+
+
+def mine_hard_negatives(
+    model: 'PrimeKGDrugRepurposingGNN',
+    z: torch.Tensor,
+    pos_edges: List[Tuple[int, int]],
+    drug_nodes: torch.Tensor,
+    disease_nodes: torch.Tensor,
+    degrees: torch.Tensor,
+    blocked_pairs: Set[Tuple[int, int]],
+    neg_per_pos: int,
+    batch_size: int,
+    max_diseases: int = 200,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mine hard negatives: for each positive (drug, disease), find the
+    highest-scoring negative drugs (false positives) under the current model.
+
+    This forces the model to learn fine-grained distinctions at the top of the ranking.
+    """
+    # Group positives by disease
+    disease_to_pos_drugs: Dict[int, Set[int]] = defaultdict(set)
+    for drug_idx, disease_idx in pos_edges:
+        disease_to_pos_drugs[disease_idx].add(drug_idx)
+
+    disease_list = list(disease_to_pos_drugs.keys())
+    if len(disease_list) > max_diseases:
+        disease_list = list(rng.choice(disease_list, size=max_diseases, replace=False))
+
+    bpr_pos_list = []
+    bpr_neg_list = []
+
+    drug_nodes_cpu = drug_nodes.cpu()
+
+    for disease_idx in disease_list:
+        pos_drugs = disease_to_pos_drugs[disease_idx]
+        if not pos_drugs:
+            continue
+
+        # Score all drugs for this disease
+        disease_tensor = torch.full_like(drug_nodes, int(disease_idx))
+        pairs = torch.stack([drug_nodes, disease_tensor])  # [2, num_drugs]
+
+        with torch.no_grad():
+            logits = []
+            for i in range(0, pairs.shape[1], batch_size):
+                batch = pairs[:, i:i + batch_size]
+                logits.append(model.score(z, batch, degrees))
+            all_scores = torch.cat(logits).cpu()
+
+        # Mask out positive drugs (set their score to -inf so they aren't selected as negatives)
+        drug_nodes_list = drug_nodes_cpu.tolist()
+        for i, d in enumerate(drug_nodes_list):
+            if (d, disease_idx) in blocked_pairs or d in pos_drugs:
+                all_scores[i] = float('-inf')
+
+        # Select top-scoring negatives (hardest false positives)
+        n_hard = min(neg_per_pos * len(pos_drugs), (all_scores > float('-inf')).sum().item())
+        if n_hard == 0:
+            continue
+
+        _, hard_indices = torch.topk(all_scores, k=int(n_hard))
+        hard_drug_nodes = [drug_nodes_list[i] for i in hard_indices.tolist()]
+
+        # Assign hard negatives round-robin to positive drugs
+        pos_drugs_list = list(pos_drugs)
+        for i, neg_drug in enumerate(hard_drug_nodes):
+            pos_drug = pos_drugs_list[i % len(pos_drugs_list)]
+            bpr_pos_list.append((pos_drug, disease_idx))
+            bpr_neg_list.append((neg_drug, disease_idx))
+
+    if not bpr_pos_list:
+        # Fallback: return empty tensors
+        return torch.zeros(2, 0, dtype=torch.long), torch.zeros(2, 0, dtype=torch.long)
+
+    pos_pairs = torch.tensor(bpr_pos_list, dtype=torch.long).T
+    neg_pairs = torch.tensor(bpr_neg_list, dtype=torch.long).T
+    return pos_pairs, neg_pairs
 
 
 def score_all_drugs_for_disease(
@@ -1158,7 +1302,7 @@ def main() -> None:
         rng=rng,
         split_name="test",
     )
-    del blocked_pairs, drug_sampling_probs, drug_nodes_np, disease_nodes_np
+    del drug_sampling_probs, drug_nodes_np, disease_nodes_np
     gc.collect()
 
     train_pairs, train_labels = create_pair_tensors(train_pos, train_neg, device)
@@ -1171,6 +1315,17 @@ def main() -> None:
         f"Val: {val_pairs.shape[1]:,}  "
         f"Test: {test_pairs.shape[1]:,}"
     )
+
+    # Build initial BPR pairs (random negatives) — hard negatives added later
+    bpr_pos_pairs, bpr_neg_pairs = build_bpr_pairs(
+        pos_edges=train_pos,
+        neg_edges=train_neg,
+        neg_per_pos=config.bpr_neg_per_pos,
+        rng=rng,
+    )
+    bpr_pos_pairs = bpr_pos_pairs.to(device)
+    bpr_neg_pairs = bpr_neg_pairs.to(device)
+    print(f"BPR pairs: {bpr_pos_pairs.shape[1]:,} (pos-neg pairings for ranking loss)")
 
     # -------------------------------
     # Model and training loop
@@ -1211,13 +1366,65 @@ def main() -> None:
         model.train()
         optimizer.zero_grad()
 
-        # Use static adjacency — model dropout provides regularization (saves ~400MB peak memory)
-        z_train = model.encode(node_type_ids, static_adj)
-        train_logits = model.score(z_train, train_pairs, degree_tensor)
+        # ── Hard negative refresh ──
+        use_hard = epoch >= config.hard_neg_start_epoch
+        if use_hard and epoch % config.hard_neg_refresh == 0:
+            model.eval()
+            with torch.no_grad():
+                z_for_mining = model.encode(node_type_ids, static_adj)
+            hard_pos, hard_neg = mine_hard_negatives(
+                model=model,
+                z=z_for_mining,
+                pos_edges=train_pos,
+                drug_nodes=drug_nodes_device,
+                disease_nodes=disease_nodes_device,
+                degrees=degree_tensor,
+                blocked_pairs=blocked_pairs,
+                neg_per_pos=config.bpr_neg_per_pos,
+                batch_size=config.batch_size,
+                rng=rng,
+            )
+            if hard_pos.shape[1] > 0:
+                hard_pos = hard_pos.to(device)
+                hard_neg = hard_neg.to(device)
 
-        bce_loss = F.binary_cross_entropy_with_logits(train_logits, train_labels)
+                # Mix: hard_neg_fraction of hard + rest random
+                n_hard = hard_pos.shape[1]
+                n_rand = bpr_pos_pairs.shape[1]
+                n_hard_use = int(n_hard * config.hard_neg_fraction)
+                # Combine: first N hard pairs + random pairs
+                bpr_pos_mixed = torch.cat([hard_pos[:, :n_hard_use], bpr_pos_pairs], dim=1)
+                bpr_neg_mixed = torch.cat([hard_neg[:, :n_hard_use], bpr_neg_pairs], dim=1)
+                print(f"  [Epoch {epoch}] Hard negatives mined: {n_hard_use:,} hard + {n_rand:,} random = {bpr_pos_mixed.shape[1]:,} total BPR pairs")
+            else:
+                bpr_pos_mixed = bpr_pos_pairs
+                bpr_neg_mixed = bpr_neg_pairs
+            model.train()
+        elif not use_hard or epoch == 1:
+            bpr_pos_mixed = bpr_pos_pairs
+            bpr_neg_mixed = bpr_neg_pairs
+
+        # ── Forward pass ──
+        z_train = model.encode(node_type_ids, static_adj)
+
+        # BPR ranking loss: score(pos_drug) should exceed score(neg_drug) for same disease
+        bpr_pos_scores = model.score(z_train, bpr_pos_mixed, degree_tensor)
+        bpr_neg_scores = model.score(z_train, bpr_neg_mixed, degree_tensor)
+        loss_bpr = bpr_loss(bpr_pos_scores, bpr_neg_scores)
+
+        # BCE calibration loss (keeps scores calibrated 0-1)
+        train_logits = model.score(z_train, train_pairs, degree_tensor)
+        loss_bce = F.binary_cross_entropy_with_logits(train_logits, train_labels)
+
+        # Degree correlation regularizer
         degree_corr_penalty = degree_correlation_regularizer(train_logits, train_pairs, degree_tensor)
-        loss = bce_loss + config.degree_corr_lambda * degree_corr_penalty
+
+        # Combined loss: BPR for ranking + BCE for calibration + degree reg
+        loss = (
+            config.bpr_weight * loss_bpr
+            + config.bce_weight * loss_bce
+            + config.degree_corr_lambda * degree_corr_penalty
+        )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_norm)
@@ -1260,7 +1467,8 @@ def main() -> None:
         history["epoch"].append(float(epoch))
         history["lr"].append(float(current_lr))
         history["train_loss"].append(float(loss.item()))
-        history["train_bce_loss"].append(float(bce_loss.item()))
+        history["train_bpr_loss"].append(float(loss_bpr.item()))
+        history["train_bce_loss"].append(float(loss_bce.item()))
         history["train_degree_corr_penalty"].append(float(degree_corr_penalty.item()))
         history["val_loss"].append(float(val_loss))
         history["val_auc"].append(float(val_binary["auc"]))
@@ -1270,11 +1478,12 @@ def main() -> None:
 
         print(
             f"Epoch {epoch:03d} | "
-            f"train_loss={loss.item():.4f} "
-            f"val_loss={val_loss:.4f} "
-            f"val_auc={val_binary['auc']:.4f} "
-            f"val_ap={val_binary['ap']:.4f} "
+            f"loss={loss.item():.4f} "
+            f"bpr={loss_bpr.item():.4f} "
+            f"bce={loss_bce.item():.4f} "
             f"val_mrr={val_ranking['mrr']:.4f} "
+            f"hits@10={val_ranking['hits@10']:.4f} "
+            f"auc={val_binary['auc']:.4f} "
             f"lr={current_lr:.2e}"
         )
 
