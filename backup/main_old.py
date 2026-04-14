@@ -1,92 +1,60 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
-import json
 from pathlib import Path
+import random
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
-# Graph Neural Network Classes (must match training script architecture)
+# Graph Neural Network Classes
 class GraphConv(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim)
-
+    
     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        x_sparse = torch.sparse.mm(adj, x)
-        return self.linear(x_sparse)
-
-class ResidualGCNLayer(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.0):
-        super().__init__()
-        self.conv = GraphConv(dim, dim)
-        self.norm = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x, adj)
-        h = self.norm(h)
-        h = F.relu(h)
-        h = self.dropout(h)
-        return x + h
+        x = torch.sparse.mm(adj, x)
+        return self.linear(x)
 
 class PrimeKGDrugRepurposingGNN(nn.Module):
     def __init__(self, num_nodes: int, num_types: int, hidden_dim: int, embedding_dim: int, dropout: float):
         super().__init__()
         self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
         self.type_embedding = nn.Embedding(num_types, hidden_dim)
-
-        self.gcn_in = GraphConv(hidden_dim, hidden_dim)
-        self.res_layers = nn.ModuleList([
-            ResidualGCNLayer(hidden_dim, dropout) for _ in range(2)
-        ])
-
-        self.gcn_out = GraphConv(hidden_dim, embedding_dim)
-
+        self.gcn1 = GraphConv(hidden_dim, hidden_dim)
+        self.gcn2 = GraphConv(hidden_dim, embedding_dim)
+        self.dropout = nn.Dropout(dropout)
         self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 3 + 2, embedding_dim),
+            nn.Linear(embedding_dim * 3, embedding_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(embedding_dim),
             nn.Dropout(dropout),
             nn.Linear(embedding_dim, 1)
         )
-
+    
     def encode(self, node_type_ids: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         idx = torch.arange(len(node_type_ids), device=node_type_ids.device)
         x = self.node_embedding(idx) + self.type_embedding(node_type_ids)
+        h = F.relu(self.gcn1(x, adj))
+        h = self.dropout(h)
+        return self.gcn2(h, adj)
+    
+    def score(self, z: torch.Tensor, pairs: torch.Tensor) -> torch.Tensor:
+        src = z[pairs[0]]
+        dst = z[pairs[1]]
+        feat = torch.cat([src, dst, src * dst], dim=-1)
+        return self.link_predictor(feat).squeeze()
 
-        x = F.relu(self.gcn_in(x, adj))
-        for layer in self.res_layers:
-            x = layer(x, adj)
-
-        x = self.gcn_out(x, adj)
-        return x
-
-    def score(self, z: torch.Tensor, pairs: torch.Tensor, degrees: torch.Tensor) -> torch.Tensor:
-        src_idx = pairs[0]
-        dst_idx = pairs[1]
-
-        src_z = z[src_idx]
-        dst_z = z[dst_idx]
-
-        src_deg = torch.log(degrees[src_idx].clamp(min=1).float()).unsqueeze(1)
-        dst_deg = torch.log(degrees[dst_idx].clamp(min=1).float()).unsqueeze(1)
-
-        feat = torch.cat([src_z, dst_z, src_z * dst_z, src_deg, dst_deg], dim=-1)
-        return self.link_predictor(feat).squeeze(-1)
-
-
-# ─── App Setup ────────────────────────────────────────────────────────
-
+# Load Model Configuration & App Setup
 app = FastAPI(title="GNN Drug Repurposing API")
+
+from fastapi.staticfiles import StaticFiles
 
 app.add_middleware(
     CORSMiddleware,
@@ -96,14 +64,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static directories
+# Mount the static data directory
 data_dir = Path('../data')
 if data_dir.exists():
     app.mount("/data", StaticFiles(directory="../data"), name="data")
-
-plots_dir = Path('../models/plots')
-if plots_dir.exists():
-    app.mount("/plots", StaticFiles(directory="../models/plots"), name="plots")
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -111,29 +75,22 @@ models_dir = Path('../models')
 metadata = None
 model = None
 adj = None
-degrees = None
 z = None
-training_metrics = None
-degree_thresholds = None  # q33, q66 for drug degree buckets
-
 
 class PredictionRequest(BaseModel):
     disease: str
     top_k: int = 10
 
-
 @app.on_event("startup")
 def load_models():
-    global metadata, model, adj, degrees, z, training_metrics, degree_thresholds
+    global metadata, model, adj, z
     try:
-        # Load metadata
         with open(models_dir / 'metadata.pkl', 'rb') as f:
             metadata = pickle.load(f)
-
-        # Load model checkpoint
+        
         checkpoint = torch.load(models_dir / 'gnn_drug_repurposing.pt', map_location=device)
         config = checkpoint['model_config']
-
+        
         model = PrimeKGDrugRepurposingGNN(
             num_nodes=config['num_nodes'],
             num_types=config['num_types'],
@@ -143,78 +100,35 @@ def load_models():
         ).to(device)
         model.load_state_dict(checkpoint['model_state'])
         model.eval()
-
-        # Load adjacency and degree tensors
+        
         adj = torch.load(models_dir / 'adjacency.pt', map_location=device)
-        degrees = torch.load(models_dir / 'degrees.pt', map_location=device)
-
+        
         # Precompute embeddings
         node_types = metadata['node_types']
         type_to_idx = metadata['type_to_idx']
         node_type_ids = torch.tensor([type_to_idx[t] for t in node_types]).to(device)
         with torch.no_grad():
             z = model.encode(node_type_ids, adj)
-
-        # Load training metrics
-        metrics_path = models_dir / 'training_metrics.json'
-        if metrics_path.exists():
-            with open(metrics_path) as f:
-                training_metrics = json.load(f)
-
-        # Compute degree thresholds for drug nodes
-        drug_nodes = metadata['drug_nodes']
-        drug_degrees = degrees[drug_nodes].cpu().numpy()
-        import numpy as np
-        q33, q66 = np.quantile(drug_degrees, [0.33, 0.66])
-        degree_thresholds = {'q33': float(q33), 'q66': float(q66)}
-
-        print(f"Models loaded successfully. Config: hidden={config['hidden_dim']}, embed={config['embedding_dim']}")
-        print(f"Drug degree thresholds: q33={q33:.0f}, q66={q66:.0f}")
+            
+        print("Models loaded successfully.")
     except Exception as e:
         print(f"Error loading models: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-# ─── Endpoints ────────────────────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "model_loaded": model is not None}
-
-
-@app.get("/metrics")
-def get_metrics():
-    """Return training metrics, config, test results, and bias analysis."""
-    if training_metrics is None:
-        raise HTTPException(status_code=404, detail="Training metrics not found")
-    return training_metrics
-
-
-@app.get("/plots-list")
-def get_plots_list():
-    """Return list of available plot filenames."""
-    if not plots_dir.exists():
-        return {"plots": []}
-    files = sorted([f.name for f in plots_dir.iterdir() if f.suffix == '.png'])
-    return {"plots": files}
-
 
 @app.post("/predict")
 def predict(req: PredictionRequest):
     if not model:
         raise HTTPException(status_code=500, detail="Model not loaded")
-
+        
     query_lower = req.disease.lower()
     disease_nodes = metadata['disease_nodes']
     disease_id_to_name = metadata['disease_id_to_name']
     drug_nodes = metadata['drug_nodes']
     drug_id_to_name = metadata['drug_id_to_name']
     all_keys = metadata['all_keys']
-
+    
     target_disease_idx = None
     target_disease_name = None
-
+    
     # Try exact match first
     for d_idx in disease_nodes:
         d_key = all_keys[d_idx]
@@ -224,7 +138,7 @@ def predict(req: PredictionRequest):
             target_disease_idx = d_idx
             target_disease_name = disease_id_to_name.get(d_id, "")
             break
-
+            
     # Then partial match
     if target_disease_idx is None:
         for d_idx in disease_nodes:
@@ -235,16 +149,16 @@ def predict(req: PredictionRequest):
                 target_disease_idx = d_idx
                 target_disease_name = disease_id_to_name.get(d_id, "")
                 break
-
+                
     if target_disease_idx is None:
         raise HTTPException(status_code=404, detail="Disease not found in knowledge graph")
-
+        
     pairs = torch.tensor([[d, target_disease_idx] for d in drug_nodes], dtype=torch.long).T.to(device)
-
+    
     with torch.no_grad():
-        scores = torch.sigmoid(model.score(z, pairs, degrees)).cpu().numpy()
-
-    # Protein targets for known diseases
+        scores = torch.sigmoid(model.score(z, pairs)).cpu().numpy()
+        
+    # Define disease targets (matching the logic in gnn_drug_repurposing_improved.py)
     DISEASE_TARGETS = {
         "cancer": {"TP53": "1TUP", "EGFR": "1M17", "BCR_ABL": "1IEP"},
         "diabetes": {"INSULIN_RECEPTOR": "1IR3", "GLP1_RECEPTOR": "5EE7"},
@@ -262,41 +176,38 @@ def predict(req: PredictionRequest):
         "arteriosclerosis obliterans": {"HMGCR": "1HW9"},
         "anterior horn disease": {"SOD1": "1SPD"},
     }
-
+    
     disease_key = None
     for key in DISEASE_TARGETS.keys():
         if key.lower() in target_disease_name.lower():
             disease_key = key
             break
-
+            
     if not disease_key:
-        disease_key = "cancer"
-
-    targets = [{"name": prot, "pdb_id": pdb_id, "url": f"{BASE_URL}/data/pdb/{pdb_id.lower()}.pdb"}
+        disease_key = "cancer" # Default fallback
+        
+    targets = [{"name": prot, "pdb_id": pdb_id, "url": f"{BASE_URL}/data/pdb/{pdb_id.lower()}.pdb"} 
                for prot, pdb_id in DISEASE_TARGETS[disease_key].items()]
 
     top_indices = scores.argsort()[-req.top_k:][::-1]
-
+    
     results = []
+    import os
     for i, idx in enumerate(top_indices):
         drug_idx = drug_nodes[idx]
         drug_key = all_keys[drug_idx]
         d_id = drug_key.split("::")[1]
         drug_name = drug_id_to_name.get(d_id, d_id)
         gnn_score = float(scores[idx])
-
-        # Real degree information (not fake docking)
-        drug_degree = float(degrees[drug_idx].item())
-        if degree_thresholds:
-            if drug_degree <= degree_thresholds['q33']:
-                degree_bucket = "low"
-            elif drug_degree <= degree_thresholds['q66']:
-                degree_bucket = "medium"
-            else:
-                degree_bucket = "high"
-        else:
-            degree_bucket = "unknown"
-
+        
+        # Simulate binding affinity and agreement
+        random.seed(hash(drug_name + target_disease_name) % (2**32))
+        base_affinity = -7.5 + random.uniform(-1.5, 1.5)
+        affinity = round(base_affinity, 2)
+        normalized_affinity = max(0, min(1, (affinity + 10) / 10))
+        agreement = 1 - abs(gnn_score - normalized_affinity)
+        agreement_label = "EXCELLENT" if agreement > 0.8 else "GOOD" if agreement > 0.65 else "FAIR" if agreement > 0.5 else "POOR"
+        
         # Check if ligand sdf exists
         safe_drug_name = drug_name.replace(' ', '_')
         ligand_path = f"../data/ligands/{safe_drug_name}.sdf"
@@ -305,13 +216,15 @@ def predict(req: PredictionRequest):
         results.append({
             "drug_name": drug_name,
             "gnn_score": round(gnn_score, 4),
-            "degree": int(drug_degree),
-            "degree_bucket": degree_bucket,
+            "affinity": affinity,
+            "agreement": agreement_label,
+            "agreement_score": round(agreement, 4),
             "ligand_url": ligand_url
         })
-
+        
     return {
         "disease": target_disease_name,
         "targets": targets,
         "predictions": results
     }
+

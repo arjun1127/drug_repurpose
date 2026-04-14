@@ -2,723 +2,439 @@
 
 ## Project Overview
 
-This project implements a comprehensive **Graph Neural Network (GNN)** system for drug repurposing using the **PrimeKG Knowledge Graph**. It combines deep learning predictions with molecular docking validation to identify potential drug candidates for diseases.
+A full-stack **Graph Neural Network (GNN)** drug repurposing system built on the **PrimeKG Knowledge Graph**. The pipeline trains a leakage-safe, bias-aware GCN model to predict novel drug-disease associations, served through a **FastAPI** backend and visualized via a **React + Vite** frontend with interactive diagnostics.
 
-The system leverages biomedical entity relationships (drugs, diseases, proteins, genes) to make predictive links between drugs and diseases, validated through actual molecular binding simulations using AutoDock Vina.
+> **Key Contribution**: This project identifies and fixes critical hub bias in GNN-based drug repurposing — where high-degree drugs (like Dexamethasone) dominate predictions regardless of disease — through inverse-degree negative sampling, degree-aware scoring, and correlation regularization.
 
 ---
 
 ## Table of Contents
 
-1. [Project Architecture](#project-architecture)
-2. [Datasets](#datasets)
-3. [Algorithms & Methods](#algorithms--methods)
-4. [Model Components](#model-components)
-5. [Data Processing Pipeline](#data-processing-pipeline)
-6. [Training & Evaluation](#training--evaluation)
-7. [Molecular Validation](#molecular-validation)
-8. [Model Deployment](#model-deployment)
-9. [Installation & Setup](#installation--setup)
-10. [Usage](#usage)
-11. [Results & Interpretation](#results--interpretation)
+1. [Architecture](#architecture)
+2. [Dataset](#dataset)
+3. [Model Architecture](#model-architecture)
+4. [Anti-Bias Pipeline](#anti-bias-pipeline)
+5. [Training & Evaluation](#training--evaluation)
+6. [Backend API](#backend-api)
+7. [Frontend Dashboard](#frontend-dashboard)
+8. [Installation & Setup](#installation--setup)
+9. [Usage](#usage)
+10. [Results](#results)
+11. [File Structure](#file-structure)
 
 ---
 
-## Project Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    GNN Drug Repurposing System               │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  1. DATA LOADING                                             │
-│     └─ PrimeKG Knowledge Graph (CSV)                         │
-│        ├─ Entity Types: Drug, Disease, Protein, Gene         │
-│        └─ Relationships: Multiple biomedical interactions    │
-│                                                               │
-│  2. GRAPH CONSTRUCTION                                       │
-│     └─ Build multi-node-type knowledge graph                 │
-│        ├─ Create node embeddings (type + ID)                 │
-│        ├─ Build bidirectional edge index                     │
-│        └─ Normalize adjacency matrix with self-loops         │
-│                                                               │
-│  3. GNN MODEL TRAINING                                       │
-│     └─ Graph Convolutional Network                           │
-│        ├─ Encode: Node → Embeddings via 2-layer GCN          │
-│        ├─ Score: Drug-Disease pair scoring                   │
-│        └─ Link Prediction: Binary classification              │
-│                                                               │
-│  4. VALIDATION WITH MOLECULAR DOCKING                        │
-│     └─ AutoDock Vina                                         │
-│        ├─ Download protein structures (PDB)                  │
-│        ├─ Prepare drug molecules (SMILES → 3D)               │
-│        └─ Compute binding affinities                         │
-│                                                               │
-│  5. INFERENCE & DEPLOYMENT                                   │
-│     └─ UDP Streaming Server                                  │
-│        ├─ Real-time drug predictions per disease             │
-│        └─ Continuous message broadcasting                    │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                   GNN Drug Repurposing System                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. DATA PIPELINE                                                │
+│     └─ PrimeKG Knowledge Graph (Harvard Dataverse)               │
+│        ├─ ~130K nodes (drug, disease, protein, gene, etc.)       │
+│        ├─ ~4M edges (biomedical relationships)                   │
+│        └─ Standardized column mapping                            │
+│                                                                  │
+│  2. LEAKAGE-SAFE GRAPH CONSTRUCTION                              │
+│     ├─ Remove val/test drug-disease edges from adjacency         │
+│     ├─ Symmetric normalization: Â = D^(-½) A D^(-½)             │
+│     └─ Degree-aware inverse-sqrt negative sampling               │
+│                                                                  │
+│  3. RESIDUAL GCN MODEL (3-layer)                                 │
+│     ├─ Input GCN: hidden_dim → hidden_dim                        │
+│     ├─ 2× Residual GCN + LayerNorm + Dropout                    │
+│     ├─ Output GCN: hidden_dim → embedding_dim                   │
+│     └─ Link Predictor: [src, dst, src⊙dst, log_deg] → score    │
+│                                                                  │
+│  4. TRAINING LOOP                                                │
+│     ├─ BCE loss + degree correlation regularizer (λ=0.1)         │
+│     ├─ ReduceLROnPlateau scheduler + gradient clipping           │
+│     └─ Early stopping on validation MRR (patience=15)            │
+│                                                                  │
+│  5. EVALUATION SUITE                                             │
+│     ├─ AUC, AP, Hits@K, MRR, Precision@K, Recall@K              │
+│     ├─ Degree-stratified metrics (low/medium/high)               │
+│     ├─ Spearman ρ (degree vs. score correlation)                 │
+│     └─ Jaccard diversity (top-K overlap across diseases)         │
+│                                                                  │
+│  6. DEPLOYMENT                                                   │
+│     ├─ FastAPI backend (model inference + metrics API)            │
+│     └─ React frontend (3-tab dashboard)                          │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Datasets
+## Dataset
 
-### **PrimeKG Knowledge Graph**
-- **Source**: Harvard Dataverse
-- **URL**: `https://dataverse.harvard.edu/api/access/datafile/6180620`
-- **Format**: CSV with relationships and entities
-- **Size**: Millions of biomedical relationships
+### PrimeKG Knowledge Graph
 
-#### Entity Types:
+| Property | Value |
+|----------|-------|
+| **Source** | Harvard Dataverse |
+| **URL** | `https://dataverse.harvard.edu/api/access/datafile/6180620` |
+| **Format** | CSV (auto-downloaded on first run) |
+| **Nodes** | ~129K (drug, disease, protein, gene, anatomy, etc.) |
+| **Edges** | ~4M biomedical relationships |
+| **Drug-Disease Positives** | ~42,383 unique pairs |
+
+### Entity Types
 - **Drug**: Chemical compounds with known pharmacological effects
 - **Disease**: Medical conditions and pathologies
-- **Protein**: Molecular targets and functional components
-- **Gene**: Genetic information and regulatory elements
+- **Protein/Gene**: Molecular targets and genetic information
 
-#### Relationship Types:
-Examples include:
-- `drug_treats_disease`
-- `protein_interacts_with_protein`
-- `gene_encodes_protein`
-- `disease_associated_with_gene`
-
-### **Column Standardization**:
-The notebook automatically handles varying column names in PrimeKG:
-- Source ID: `x_id` / `x_index` → `source_id`
-- Source Type: `x_type` → `source_type`
-- Target ID: `y_id` / `y_index` → `target_id`
-- Target Type: `y_type` → `target_type`
-- Relation: `relation` / `display_relation` → `relation`
+### Column Standardization
+The pipeline auto-detects column names across PrimeKG versions:
+- `x_id` / `x_index` → `source_id`
+- `x_type` / `source_type` → `source_type`
+- `y_id` / `y_index` → `target_id`
+- `y_type` / `target_type` → `target_type`
 
 ---
 
-## Algorithms & Methods
+## Model Architecture
 
-### **1. Graph Construction**
+### 3-Layer Residual GCN
 
-#### Node Indexing:
 ```
-Node Key Format: "entity_type::entity_id"
-Example: "drug::DB00001", "disease::MESH:D000001"
-```
-
-- Unique node identifiers created by combining entity type and ID
-- Bidirectional edge creation for information flow in both directions
-- Total nodes extracted from the knowledge graph
-
-#### Adjacency Matrix Normalization:
-```
-Formula: Ã = (D + I)^(-1/2) * A * (D + I)^(-1/2)
-
-Where:
-- A = Adjacency matrix
-- I = Identity matrix (self-loops)
-- D = Degree matrix (diagonal matrix of node degrees)
+Node Index ──→ Embedding(num_nodes, 128)  ─┐
+                                            ├──→ Add ──→ GCN_in(128→128) + ReLU
+Node Type ──→ Embedding(num_types, 128)  ──┘               │
+                                                            ▼
+                                                  ResidualGCN × 2
+                                                  ├─ GCN(128→128)
+                                                  ├─ LayerNorm
+                                                  ├─ ReLU + Dropout(0.2)
+                                                  └─ Skip Connection (x + h)
+                                                            │
+                                                            ▼
+                                                    GCN_out(128→64)
+                                                            │
+                                                     Node Embeddings (64-dim)
 ```
 
-**Why this normalization?**
-- Prevents vanishing gradients during message passing
-- Normalizes by degree to prevent high-degree nodes from dominating
-- Self-loops ensure nodes consider their own features
+### Degree-Aware Link Predictor
+
+```
+Input: [z_src, z_dst, z_src ⊙ z_dst, log(deg_src), log(deg_dst)]
+       ─── 64 + 64 + 64 + 1 + 1 = 194 features ───
+                        │
+                Linear(194 → 64) + ReLU
+                        │
+                 BatchNorm1d(64)
+                        │
+                   Dropout(0.2)
+                        │
+                  Linear(64 → 1)
+                        │
+                     Logit Score
+```
+
+**Why degree features?** By giving the model explicit access to `log(degree)`, it can learn to discount the influence of node popularity rather than using it as a shortcut.
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Hidden Dimension | 128 |
+| Embedding Dimension | 64 |
+| GCN Layers | 3 (1 input + 2 residual) |
+| Dropout | 0.2 |
+| Learning Rate | 1e-3 (AdamW) |
+| Weight Decay | 1e-5 |
+| Negative Ratio | 3:1 |
+| Early Stopping Patience | 15 epochs |
+| Gradient Clip Norm | 1.0 |
+| Degree Correlation λ | 0.1 |
 
 ---
 
-### **2. Graph Convolutional Networks (GCN)**
+## Anti-Bias Pipeline
 
-#### Single GCN Layer Formula:
-```
-H(l+1) = σ(Ã * H(l) * W(l) + b(l))
+### Critical Bugs Fixed from Original Model
 
-Where:
-- H(l) = Node feature matrix at layer l
-- Ã = Normalized adjacency matrix
-- W(l) = Weight matrix (learnable parameters)
-- σ = Activation function (ReLU)
-- b(l) = Bias term
-```
+| Bug | Problem | Fix |
+|-----|---------|-----|
+| **Test Edge Leakage** | Adjacency included test drug-disease edges during training — model saw answers | Removed val/test edges from message-passing graph |
+| **Uniform Negative Sampling** | `random.choice()` gave high-degree drugs too few negatives | Inverse-sqrt degree-weighted sampling: P(drug) ∝ degree^(-0.5) |
+| **1:1 Negative Ratio** | Equal positives and negatives; real space is >99% negative | 3:1 negative ratio |
+| **No Over-Smoothing Prevention** | 2-layer GCN without residuals; embeddings collapse | 3-layer GCN with skip connections + LayerNorm |
+| **No Early Stopping** | Fixed 100 epochs, no validation monitoring | Early stopping on val MRR with patience=15 |
+| **No LR Scheduling** | Constant 1e-3 for all epochs | ReduceLROnPlateau (factor=0.5, patience=5) |
+| **AUC-Only Evaluation** | Single metric misses hub bias | Full suite: AUC, AP, MRR, Hits@K, Spearman ρ, Jaccard |
 
-#### Two-Layer GCN Architecture:
-```
-Input (Node Features) 
-       ↓
-    [GCN-1: HIDDEN_DIM → HIDDEN_DIM]
-       ↓ (ReLU + Dropout)
-    [GCN-2: HIDDEN_DIM → EMBEDDING_DIM]
-       ↓
- Output (Node Embeddings)
-```
+### Countermeasures Applied
 
-**Configuration Parameters**:
-- `HIDDEN_DIM = 256`: Intermediate representation size
-- `EMBEDDING_DIM = 128`: Final embedding dimensionality
-- `DROPOUT = 0.2`: Regularization during training
-
----
-
-### **3. Node Embedding Strategy**
-
-Each node's initial representation combines:
-```
-Initial_Embedding = Node_ID_Embedding + Entity_Type_Embedding
-
-Where:
-- Node_ID_Embedding: Learned embedding for specific node identity
-- Entity_Type_Embedding: Learned embedding for entity type (drug/disease/protein/gene)
-```
-
-**Advantages**:
-- Captures both node-specific and type-specific information
-- Types share representation learning (data efficiency)
-- Allows generalization to unseen node IDs with known types
-
----
-
-### **4. Link Prediction for Drug-Disease Associations**
-
-#### Scoring Function:
-```
-score(drug_idx, disease_idx) = MLP([z_drug || z_disease || z_drug ⊙ z_disease])
-
-Where:
-- z_drug = Embedding vector for drug node
-- z_disease = Embedding vector for disease node
-- || = Concatenation operator
-- ⊙ = Element-wise multiplication (Hadamard product)
-- MLP = Multi-layer perceptron
-```
-
-#### MLP Architecture:
-```
-Concatenated Features (384-dim for 128-dim embeddings)
-    ↓
-  [Linear: 384 → 128]
-    ↓
-    [ReLU]
-    ↓
-  [Dropout(0.2)]
-    ↓
-  [Linear: 128 → 1]
-    ↓
- Output Score [0, 1] via Sigmoid
-```
-
-**Why this design?**
-- Concatenation captures individual drug and disease embeddings
-- Hadamard product captures interaction patterns
-- Non-linear MLP learns complex scoring relationships
-
----
-
-### **5. Training with Negative Sampling**
-
-#### Dataset Splits:
-```
-Known Drug-Disease Pairs
-    ├─ 80%: Training Set
-    ├─ 10%: Validation Set
-    └─ 10%: Test Set
-```
-
-#### Balanced Classification:
-```
-Training Batch Composition:
-├─ Positive Pairs: Known drug-disease associations (label = 1)
-└─ Negative Pairs: Random drug-disease pairs NOT in knowledge graph (label = 0)
-
-Ratio: NEGATIVE_SAMPLE_RATIO = 1.0 (1:1 positive-to-negative)
-```
-
-**Why negative sampling is important**:
-- Knowledge graphs are sparse (far more false pairs than true ones)
-- 1:1 ratio prevents class imbalance from skewing training
-- Forces model to distinguish between true and random associations
-
-#### Loss Function:
-```
-Loss = Binary Cross-Entropy with Logits
-
-L = -[y * log(σ(logits)) + (1-y) * log(1 - σ(logits))]
-
-Where:
-- y = True label (0 or 1)
-- σ(logits) = Sigmoid probability
-- Average over all training pairs
-```
-
----
-
-### **6. Optimization**
-
-#### Optimizer Configuration:
-```
-torch.optim.Adam(
-    parameters=model.parameters(),
-    lr=0.001,                    # Learning rate
-    weight_decay=1e-5            # L2 regularization
-)
-```
-
-**Training Loop**:
-1. **Forward Pass**: Encode graph → Score training pairs → Compute loss
-2. **Backward Pass**: Backpropagation through GNN and MLP
-3. **Optimization**: Update weights using Adam
-4. **Validation**: Every 10 epochs on validation set
-5. **Metric**: ROC-AUC score (measures ranking quality)
-
----
-
-### **7. Inference: Drug Discovery for a Disease**
-
-Process for finding drug candidates:
-```
-1. User Query → Search for disease in knowledge graph
-   Example: "Anemia" → Find matching disease entities
-   
-2. Load Final Embeddings → Run GNN on full graph once
-   All disease embeddings Z_disease are computed
-   
-3. Score All Drugs → For selected disease:
-   For each drug node:
-       score = model.score(drug_embedding, disease_embedding)
-   
-4. Rank by Score → Sort drugs by association strength (descending)
-   
-5. Return Top-K → Display top 10 most promising candidates
-   Including:
-   - Drug name
-   - Association score (0.0-1.0)
-   - Confidence level (HIGH/MEDIUM/LOW)
-```
-
----
-
-## Model Components
-
-### **1. GraphConv Layer**
-```python
-class GraphConv(nn.Module):
-    """Implements single graph convolutional operation"""
-    - Aggregate neighborhood information via sparse matrix multiplication
-    - Apply linear transformation to aggregated features
-```
-
-### **2. PrimeKGDrugRepurposingGNN Model**
-```python
-class PrimeKGDrugRepurposingGNN(nn.Module):
-    Components:
-    ├─ node_embedding: Embedding(num_nodes, HIDDEN_DIM)
-    │  └─ Learns unique representation for each node
-    ├─ type_embedding: Embedding(num_types, HIDDEN_DIM)
-    │  └─ Learns representation for Drug/Disease/Protein/Gene
-    ├─ gcn1: GraphConv(HIDDEN_DIM → HIDDEN_DIM)
-    │  └─ First message passing layer with ReLU activation
-    ├─ gcn2: GraphConv(HIDDEN_DIM → EMBEDDING_DIM)
-    │  └─ Second message passing layer (final embeddings)
-    ├─ dropout: Dropout(0.2)
-    │  └─ Prevents overfitting by randomly zeroing activations
-    └─ link_predictor: MLP
-       └─ Scores drug-disease pairs for ranking
-```
-
----
-
-## Data Processing Pipeline
-
-### **Step 1: Download & Load**
-```
-Harvard Dataverse → CSV File → Pandas DataFrame
-- Automatic caching to avoid re-downloads
-- Supports custom max_rows for testing on subsets
-```
-
-### **Step 2: Column Standardization**
-```
-Raw CSV columns (variable naming) → Standardized format
-- source_id, source_type, target_id, target_type, relation
-- Case normalization (lowercase)
-- Remove null values
-```
-
-### **Step 3: Name Mappings**
-```
-Extract Human-Readable Names:
-├─ disease_id_to_name: "MESH:D000001" → "Anemia"
-└─ drug_id_to_name: "DB00001" → "Lepirudin"
-
-Used for display in disease search and drug rankings
-```
-
-### **Step 4: Graph Construction**
-```
-Create unique nodes:
-├─ Format: entity_type::entity_id
-├─ Example: "drug::DB00001", "disease::MESH:D000001"
-└─ Build complete mapping: node_key → node_index
-
-Create edges:
-├─ Extract source and target node indices
-├─ Create bidirectional edges (undirected information flow)
-└─ Store as edge_index tensor: [2, num_edges]
-```
-
-### **Step 5: Adjacency Normalization**
-```
-Raw edge list → Normalized adjacency matrix
-├─ Add self-loops (each node connected to itself)
-├─ Compute degree normalization: D^(-1/2)
-├─ Create sparse COO tensor (memory efficient)
-└─ Coalesce to combine duplicate indices
-```
+1. **Inverse-degree negative sampling** — High-degree drugs get proportionally more negatives
+2. **Degree correlation loss** — Penalty term: λ·|corr(scores, log_degree)| added to BCE
+3. **Degree-aware scoring** — Link predictor receives `log(degree)` as explicit features
+4. **Residual GCN** — Skip connections prevent over-smoothing of embeddings
+5. **Leakage-safe splits** — Val/test drug-disease edges removed from training adjacency
 
 ---
 
 ## Training & Evaluation
 
-### **Configuration Parameters**:
-```python
-# Network Architecture
-HIDDEN_DIM = 256           # Intermediate layer size
-EMBEDDING_DIM = 128        # Final embedding dimension
-DROPOUT = 0.2              # Regularization parameter
+### Data Splits
 
-# Training
-EPOCHS = 100               # Number of training iterations
-BATCH_SIZE = 512           # Samples per batch
-LR = 1e-3                  # Learning rate
-WEIGHT_DECAY = 1e-5        # L2 regularization coefficient
+| Split | Positives | Negatives (3:1) |
+|-------|-----------|-----------------|
+| Train | 33,907 | 101,721 |
+| Validation | 4,238 | 12,714 |
+| Test | 4,238 | 12,714 |
 
-# Data Splits
-VAL_RATIO = 0.1            # 10% validation
-TEST_RATIO = 0.1           # 10% test
-NEGATIVE_SAMPLE_RATIO = 1.0  # 1:1 positive:negative ratio
+### Training Process
 
-# Inference
-TOP_K = 10                 # Return top 10 candidates
-SEED = 42                  # Reproducibility
+```
+For each epoch:
+  1. Forward: encode(node_type_ids, adjacency) → embeddings
+  2. Score: link_predictor(src, dst, src⊙dst, log_deg) → logits
+  3. Loss: BCE(logits, labels) + λ·|corr(scores, degree)|
+  4. Backward: gradient clipping at norm=1.0
+  5. Optimize: AdamW step
+  6. Every 5 epochs: validate on held-out set
+  7. Track best val MRR → save checkpoint
+  8. Early stop if no improvement for 15 eval cycles
 ```
 
-### **Training Metrics**:
+### Evaluation Metrics
 
-#### Binary Cross-Entropy Loss
-- Measures how well model predicts true/false associations
-- Lower is better; typical range: 0.1 - 0.7 from start to convergence
+| Metric | Description |
+|--------|-------------|
+| **ROC-AUC** | Link prediction discrimination |
+| **Average Precision** | Ranking quality under class imbalance |
+| **MRR** | Mean reciprocal rank of true drugs |
+| **Hits@1/5/10** | Fraction of true drugs in top-K |
+| **Precision@K / Recall@K** | Per-disease ranking precision & recall |
+| **Spearman ρ** | Degree vs. score correlation (bias metric) |
+| **Jaccard Diversity** | Top-K overlap across diseases (diversity metric) |
+| **Degree-Stratified AUC** | AUC breakdown by drug degree bucket |
 
-#### ROC-AUC Score
-- Area Under the Receiver Operating Characteristic Curve
-- Measures ranking quality (not just classification accuracy)
-- **Range**: 0.5 (random) to 1.0 (perfect ranking)
-- **Typical Results**: 0.75-0.95 for well-trained models
+### Diagnostic Plots (saved to `models/plots/`)
 
-#### Loss Components:
-```
-Total Loss = Binary Cross-Entropy Loss
-           + L2 Regularization (weight_decay)
-```
-
-### **Validation Strategy**:
-- Evaluated every 10 epochs on held-out validation set
-- Uses same evaluation metrics as test set
-- Model checkpoint tracking (best AUC retained)
+| Plot | Purpose |
+|------|---------|
+| `training_curves.png` | Train/val loss + MRR over epochs |
+| `degree_distribution.png` | Drug degree histogram in PrimeKG |
+| `degree_vs_score.png` | Scatter of degree vs. mean predicted score |
+| `roc_pr_curves.png` | ROC and Precision-Recall curves on test set |
+| `degree_stratified_metrics.png` | AUC by degree bucket (low/medium/high) |
+| `topk_diversity.png` | Jaccard similarity distribution across disease pairs |
 
 ---
 
-## Molecular Validation
+## Backend API
 
-### **Why Validation with Docking?**
-- **GNN Advantage**: Fast, scalable predictions across millions of pairs
-- **Docking Advantage**: Ground truth physics/chemistry validation
-- **Combined Approach**: Confidence in predictions when both agree
+### Technology: FastAPI + PyTorch
 
-### **AutoDock Vina Integration**
+The backend loads the trained model checkpoint, precomputes embeddings once at startup, and serves predictions via REST endpoints.
 
-#### Workflow:
-```
-1. Get GNN Predictions
-   └─ Top-K drugs from GNN rankings
-   
-2. Find Disease Targets
-   └─ Disease-specific protein targets from PrimeKG
-   
-3. Prepare Proteins
-   └─ Download 3D structures from PDB database
-   
-4. Prepare Drugs
-   └─ Convert SMILES notation → 3D molecular structure
-   └─ Generate conformers (spatial configurations)
-   
-5. Run Docking
-   └─ AutoDock Vina computes binding energy
-   └─ Output: Binding affinity (kcal/mol)
-   
-6. Compare Results
-   └─ GNN scores vs Docking affinities
-   └─ Compute agreement metrics
-```
+### Endpoints
 
-### **Binding Affinity Interpretation**:
-```
-Binding Affinity (kcal/mol)    | Interpretation
-─────────────────────────────────────────────────
--9.0 or lower                  | Excellent (very strong)
--7.0 to -9.0                   | Good (strong)
--5.0 to -7.0                   | Moderate
--3.0 to -5.0                   | Weak
-Above -3.0                     | Very weak / No binding
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check + model loaded status |
+| `GET` | `/metrics` | Full training metrics JSON (config, test results, bias analysis, history) |
+| `GET` | `/plots-list` | List of available diagnostic plot filenames |
+| `GET` | `/plots/{filename}` | Static serving of plot images |
+| `POST` | `/predict` | Drug predictions for a disease query |
 
-Rule: More negative = stronger binding
-```
+### Prediction Request
 
-### **Validation Metrics**:
-```
-Agreement Score = 1 - |gnn_score - normalized_affinity|
-
-Where:
-- GNN score ∈ [0, 1]
-- Normalized affinity = (actual_affinity + 10) / 10 ∈ [0, 1]
-
-Interpretation:
-- > 0.80: Excellent agreement ✓
-- 0.65-0.80: Good agreement ✓
-- 0.50-0.65: Fair agreement ⚠
-- < 0.50: Poor agreement ✗
-```
-
----
-
-## Model Deployment
-
-### **Model Artifacts Saved**:
-
-#### 1. Model State (`gnn_drug_repurposing.pt`)
-```python
+```json
+POST /predict
 {
-    'model_state': state_dict,           # Trained weights
-    'model_config': {                    # Architecture info
-        'num_nodes': 15000,              # Example
-        'num_types': 4,                  # Drug, Disease, Protein, Gene
-        'hidden_dim': 256,
-        'embedding_dim': 128,
-        'dropout': 0.2
-    }
+  "disease": "cancer",
+  "top_k": 12
 }
 ```
 
-#### 2. Metadata (`metadata.pkl`)
-```python
-{
-    'all_keys': [...],                   # Node identifiers
-    'node_map': {...},                   # Key → Index mapping
-    'node_types': [...],                 # Type per node
-    'type_to_idx': {...},                # Type → Index mapping
-    'drug_nodes': [...],                 # Drug node indices
-    'disease_nodes': [...],              # Disease node indices
-    'disease_id_to_name': {...},         # ID → Human-readable names
-    'drug_id_to_name': {...}             # ID → Human-readable names
-}
-```
+### Prediction Response
 
-#### 3. Adjacency Matrix (`adjacency.pt`)
-```
-Sparse COO tensor containing normalized adjacency matrix
-- Memory efficient (only stores non-zero entries)
-- Ready for sparse matrix operations during inference
-```
-
-### **UDP Streaming Server**
-
-#### Purpose:
-Real-time broadcast of drug predictions over UDP network protocol.
-
-#### Configuration:
-```python
-UDP_HOST = "192.168.31.103"    # Target IP address
-UDP_PORT = 5005                # Target port
-DISEASE_QUERY = "Anemia"       # Disease to predict for
-TOP_K = 10                     # Return top 10 candidates
-SEND_INTERVAL_SEC = 2.0        # Send every 2 seconds
-BURST_COUNT = 3                # Send 3 copies (UDP is lossy)
-BURST_GAP_SEC = 0.05           # Gap between copies
-```
-
-#### Payload Structure:
 ```json
 {
-  "event": "gnn_drug_predictions",
-  "timestamp_utc": "2026-03-05T...",
-  "msg_id": 1,
-  "model_path": "models/gnn_drug_repurposing.pt",
-  "disease_query": "Anemia",
-  "disease": {
-    "idx": 4521,
-    "id": "MESH:D000740",
-    "name": "Anemia"
-  },
-  "top_k": 10,
+  "disease": "malignant neoplasm of breast",
+  "targets": [
+    {"name": "TP53", "pdb_id": "1TUP", "url": "http://..."}
+  ],
   "predictions": [
     {
-      "rank": 1,
-      "drug_idx": 1203,
-      "drug_id": "DB00001",
-      "drug_name": "Lepirudin",
-      "score": 0.8523
-    },
-    ...
+      "drug_name": "Dexamethasone",
+      "gnn_score": 0.9821,
+      "degree": 742,
+      "degree_bucket": "high",
+      "ligand_url": null
+    }
   ]
 }
 ```
 
-#### Continuous Streaming:
-- Sends batches of 3 identical packets (with 50ms gaps)
-- Repeats every 2 seconds
-- Includes message ID and timestamp for tracking
-- UDP broadcast allows multiple clients to receive simultaneously
+---
+
+## Frontend Dashboard
+
+### Technology: React 19 + Vite + TypeScript + Framer Motion
+
+A 3-tab dashboard with glassmorphism design and animated transitions:
+
+### Tab 1: Drug Discovery
+- Search bar for disease queries
+- Drug prediction cards with GNN score + degree info
+- Target protein visualization (3Dmol.js PDB viewer)
+- Optional 3D ligand structure viewer (SDF format)
+
+### Tab 2: Model Performance
+- Key metrics hero cards (Test AUC, AP, Best Epoch, MRR, Hits@10)
+- Training configuration table
+- All 6 diagnostic plots displayed in a responsive grid
+
+### Tab 3: Bias Analysis
+- Spearman ρ correlation card with severity coloring
+- Top-1 mode fraction (same drug ranking #1 across diseases)
+- Mean/P90 Jaccard similarity metrics
+- Degree-stratified AUC bar chart (low/medium/high)
+- Changelog of all anti-bias countermeasures implemented
 
 ---
 
 ## Installation & Setup
 
-### **Requirements**:
+### Prerequisites
+
 ```
-Python 3.8+
-CUDA 11.0+ (optional, for GPU acceleration)
+Python 3.10+
+Node.js 18+
 ```
 
-### **Dependencies**:
+### 1. Clone & Setup Backend
+
 ```bash
-# Core ML/Data Science
-torch>=1.9.0              # PyTorch deep learning
-pandas>=1.3.0             # Data manipulation
-numpy>=1.20.0             # Numerical computing
-scikit-learn>=0.24.0      # Evaluation metrics
-requests>=2.26.0          # Download files
-
-# Molecular Docking
-meeko                     # Prepare molecules for docking
-vina                      # AutoDock Vina engine
-biopython>=1.80           # Protein structure tools
-rdkit                     # Cheminformatics
-
-# Utilities
-tqdm                      # Progress bars
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### **Installation**:
+### 2. Train the Model
+
 ```bash
-pip install torch pandas numpy scikit-learn requests tqdm biopython rdkit meeko vina
+# From project root, with venv activated:
+python3 gnn_drug_repurposing_improved.py --device auto --epochs 200
+
+# Options:
+#   --hidden-dim 128     (default)
+#   --embedding-dim 64   (default)
+#   --negative-ratio 3.0 (default)
+#   --eval-every 5       (default)
+#   --run-tsne           (optional, uses extra memory)
+```
+
+This produces artifacts in `models/`:
+- `gnn_drug_repurposing.pt` — Model checkpoint
+- `adjacency.pt` — Normalized adjacency matrix
+- `degrees.pt` — Node degree tensor
+- `metadata.pkl` — Node maps and entity names
+- `training_metrics.json` — All metrics and training history
+- `plots/` — 6 diagnostic PNG plots
+
+### 3. Start Backend
+
+```bash
+cd backend
+source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### 4. Start Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` in browser.
+
+### Backend Dependencies (`backend/requirements.txt`)
+
+```
+fastapi
+uvicorn
+torch
+numpy
+pandas
+pydantic
+scikit-learn
+python-dotenv
+```
+
+### Frontend Dependencies
+
+```
+react, react-dom, axios, framer-motion, lucide-react, 3dmol, vite, typescript
 ```
 
 ---
 
 ## Usage
 
-### **Basic Workflow**:
+### 1. Drug Discovery
 
-#### 1. Load and Train Model
-```python
-# Configuration in notebook sets parameters
-# Run all cells 1-24 to:
-# - Download PrimeKG data
-# - Build knowledge graph
-# - Train GNN for 100 epochs
-# - Evaluate on test set
-```
+Open the frontend → **Drug Discovery** tab → type a disease name → click **Discover**.
 
-#### 2. Query Disease & Get Predictions
-```python
-# In cell 28-33:
-disease_query = "Anemia"  # Search for disease
-# Returns top 10 drug candidates with scores
+Example queries: `cancer`, `diabetes`, `anemia`, `leukemia`, `parkinson`
 
-# Example output:
-# 1. Lepirudin (score: 0.8523) - HIGH confidence
-# 2. Argatroban (score: 0.7812) - HIGH confidence
-# 3. Pentoxifylline (score: 0.6234) - MEDIUM confidence
-```
+### 2. Review Model Performance
 
-#### 3. Validate with Molecular Docking
-```python
-# In cells 34-40:
-# - Automatically prepares drug molecules
-# - Downloads target proteins
-# - Runs AutoDock Vina
-# - Compares GNN vs docking scores
-```
+Click the **Model Performance** tab to see:
+- Test AUC, Average Precision, Best Epoch, MRR, Hits@10
+- Full training configuration
+- 6 diagnostic plots
 
-#### 4. Deploy for Inference
-```python
-# In cells 41-42:
-# - Save model and metadata
-# - Start UDP streaming server
-# - Continuous broadcast of predictions
-```
+### 3. Analyze Bias
+
+Click **Bias Analysis** tab to see:
+- Spearman ρ (degree-score correlation)
+- Top-1 mode fraction
+- Jaccard diversity metrics
+- Degree-stratified AUC breakdown
+- Complete list of anti-bias countermeasures
 
 ---
 
-## Results & Interpretation
+## Results
 
-### **Expected Performance**:
+### Training Results (200 epochs, early stopped at epoch 125)
 
-#### Model Training Results:
-```
-Training Metrics (100 epochs):
-├─ Final Training Loss: 0.25-0.35
-├─ Final Validation AUC: 0.80-0.92
-└─ Final Test AUC: 0.78-0.90
+| Metric | Value |
+|--------|-------|
+| Test ROC-AUC | 0.994 |
+| Test Average Precision | 0.989 |
+| Test MRR | 0.025 |
+| Test Hits@10 | 5.8% |
+| Best Validation MRR | 0.029 (epoch 125) |
 
-Note: Exact values depend on PrimeKG subset size and entity distribution
-```
+### Bias Metrics
 
-#### Drug Discovery Results:
-```
-For "Anemia" query (example):
-Rank │ Drug Name           │ GNN Score │ Confidence
-──────┼─────────────────────┼───────────┼────────────
-  1  │ Lepirudin           │ 0.8523    │ HIGH
-  2  │ Argatroban          │ 0.7812    │ HIGH
-  3  │ Pentoxifylline      │ 0.6234    │ MEDIUM
-  4  │ Cilostazol          │ 0.5789    │ MEDIUM
-  ...
-```
+| Metric | Value | Target | Status |
+|--------|-------|--------|--------|
+| Spearman ρ | 0.884 | < 0.40 | ⚠️ Remaining bias |
+| Mean Jaccard | 0.543 | < 0.25 | ⚠️ Moderate overlap |
+| Top-1 Mode Fraction | 36.7% | < 10% | ⚠️ Dexamethasone dominates |
+| P90 Jaccard | 0.818 | < 0.50 | ⚠️ High overlap at P90 |
 
-#### Molecular Validation:
-```
-Drug              │ GNN Score │ Best Affinity │ Agreement
-──────────────────┼───────────┼───────────────┼────────────
-Lepirudin         │ 0.8523    │ -7.85 kcal/mol│ ✓ EXCELLENT
-Argatroban        │ 0.7812    │ -6.92 kcal/mol│ ✓ GOOD
-Pentoxifylline    │ 0.6234    │ -5.11 kcal/mol│ ⚠ FAIR
-```
+### Degree-Stratified AUC
 
-### **Interpretation Guide**:
+| Bucket | AUC | Count |
+|--------|-----|-------|
+| Low (degree ≤ 1) | 0.694 | 9,446 |
+| Medium (1 < degree ≤ 255) | 0.980 | 3,685 |
+| High (degree > 255) | 0.962 | 3,821 |
 
-#### High GNN Score (> 0.75)
-- Model predicts strong drug-disease association
-- Usually substantiated by molecular docking
-- **Next Step**: Consider for experimental validation
-
-#### Medium GNN Score (0.50-0.75)
-- Moderate computational prediction
-- May have some biological relevance
-- **Next Step**: Compare with docking data; may need further analysis
-
-#### Low GNN Score (< 0.50)
-- Weak predicted association
-- Usually not supported by docking
-- **Next Step**: Likely false positive; deprioritize
-
-### **Biological Validation Checklist**:
-```
-For each top-K prediction:
-⬜ Check literature for known interactions
-⬜ Compare with DrugBank positive cases
-⬜ Verify protein targets are disease-relevant
-⬜ Assess molecular docking agreement
-⬜ Evaluate safety profiles and side effects
-⬜ Consider known drug mechanisms vs. disease pathology
-```
+> **Note**: Hub bias remains significant despite countermeasures. The low-degree AUC of 0.694 vs high-degree AUC of 0.962 shows the model still performs better for well-connected drugs. Further work on graph augmentation, attention-based aggregation, or contrastive learning could improve this.
 
 ---
 
@@ -726,70 +442,80 @@ For each top-K prediction:
 
 ```
 majorProj/
-├── gnn_drug_repurposing_improved.ipynb    # Main notebook
-├── GNNDrug_(1).ipynb                      # Alternative notebook
-├── udp_veiwer.py                          # UDP receiver/viewer
-├── __pycache__/                           # Python cache
-├── data/                                  # (Created during run)
-│   ├── primekg.csv                        # Knowledge graph
-│   ├── pdb/                               # Protein structures
-│   └── ligands/                           # Drug molecules
-├── models/                                # (Created during run)
-│   ├── gnn_drug_repurposing.pt           # Trained model
-│   ├── metadata.pkl                       # Graph metadata
-│   └── adjacency.pt                       # Adjacency matrix
-└── README.md                              # This file
+├── gnn_drug_repurposing_improved.py   # Training pipeline (memory-optimized)
+├── gnn_drug_repurposing_old.py        # Original script (backup)
+├── evaluate_model_bias.py             # Standalone bias evaluation
+├── prepare_10_diseases.py             # Pre-compute disease assets
+├── README.md                          # This file
+│
+├── backend/
+│   ├── main.py                        # FastAPI server
+│   ├── requirements.txt               # Python dependencies
+│   ├── .env                           # BASE_URL config
+│   ├── run.sh                         # Startup script
+│   └── venv/                          # Python virtual environment
+│
+├── frontend/
+│   ├── src/
+│   │   ├── App.tsx                    # Main 3-tab dashboard
+│   │   ├── index.css                  # Design system (glassmorphism)
+│   │   ├── main.tsx                   # Entry point
+│   │   └── components/
+│   │       └── MolecularViewer.tsx    # 3Dmol.js wrapper
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── .env                          # VITE_API_URL config
+│
+├── data/
+│   ├── primekg.csv                    # PrimeKG dataset (auto-downloaded)
+│   ├── pdb/                           # Protein structure files
+│   └── ligands/                       # Drug SDF files
+│
+├── models/
+│   ├── gnn_drug_repurposing.pt        # Trained model checkpoint
+│   ├── adjacency.pt                   # Sparse adjacency matrix
+│   ├── degrees.pt                     # Node degree tensor
+│   ├── metadata.pkl                   # Node maps + entity names
+│   ├── training_metrics.json          # Full metrics + history
+│   └── plots/                         # Diagnostic visualizations
+│       ├── training_curves.png
+│       ├── degree_distribution.png
+│       ├── degree_vs_score.png
+│       ├── roc_pr_curves.png
+│       ├── degree_stratified_metrics.png
+│       └── topk_diversity.png
+│
+└── backup/                            # Project backup
 ```
 
 ---
 
-## Key Innovations
+## Technical Notes
 
-1. **Bidirectional Knowledge Graph**: Information flows in both directions through drug, disease, protein, and gene networks
+### Memory Optimization
+The training script is optimized for systems with **8GB RAM**:
+- Raw DataFrame freed immediately after name extraction (~600MB saved)
+- Standardized DataFrame freed after node artifact construction
+- Edge index arrays freed after adjacency is built
+- Explicit `gc.collect()` at strategic points
+- Static adjacency used during training (no per-epoch rebuild)
 
-2. **Combined Scoring**: Concatenation + Hadamard product in link predictor captures both individual features and interactions
-
-3. **Proper Validation Split**: Clear separation of train/val/test prevents information leakage
-
-4. **Balanced Negative Sampling**: 1:1 ratio ensures model learns to distinguish true from false associations
-
-5. **Molecular Validation**: AutoDock docking provides independent ground-truth validation of GNN predictions
-
-6. **Real-time Deployment**: UDP streaming enables continuous delivery of predictions to client applications
-
----
-
-## Future Enhancements
-
-1. **Multi-hop Reasoning**: Consider drug-protein-gene-disease paths
-2. **Temporal Dynamics**: Track how associations change over time
-3. **Uncertainty Quantification**: Add confidence intervals to predictions
-4. **Fine-tuning with Docking Data**: Retrain GNN using binding affinities as auxiliary loss
-5. **Disease-specific Models**: Train separate GNNs for different disease categories
-6. **Side Effect Prediction**: Add models to predict adverse reactions
-7. **Web Interface**: Build frontend for interactive drug discovery
+### Reproducibility
+- Seed: 42 (set for Python, NumPy, and PyTorch)
+- Fixed train/val/test splits via seeded RNG
+- Deterministic negative sampling
 
 ---
 
 ## References
 
-- **PrimeKG Dataset**: Varshney et al., "PrimeKG: A Knowledge Graph for Precision Medicine"
-- **Graph Convolutional Networks**: Kipf & Welling, "Semi-Supervised Classification with Graph Convolutional Networks" (ICLR 2017)
-- **AutoDock Vina**: Trott & Olson, "AutoDock Vina: Improving the speed and accuracy of docking with a new scoring function, efficient optimization, and multithreading" (Journal of Computational Chemistry, 2010)
-- **Link Prediction**: Liben-Nowell & Kleinberg, "The link prediction problem for social networks"
+- **PrimeKG**: Chandak et al., "Building a knowledge graph to enable precision medicine" (Scientific Data, 2023)
+- **GCN**: Kipf & Welling, "Semi-Supervised Classification with Graph Convolutional Networks" (ICLR 2017)
+- **Link Prediction**: Zhang & Chen, "Link Prediction Based on Graph Neural Networks" (NeurIPS 2018)
+- **DropEdge**: Rong et al., "DropEdge: Towards Deep Graph Convolutional Networks on Node Classification" (ICLR 2020)
 
 ---
 
 ## License & Attribution
 
-This project uses publicly available datasets and open-source software. Ensure proper attribution when publishing results.
-
----
-
-## Contact & Support
-
-For issues or questions, refer to:
-- Notebook cell comments for implementation details
-- Configuration section for parameter tuning
-- Molecular validation section for docking troubleshooting
-
+This project uses publicly available datasets (PrimeKG from Harvard Dataverse) and open-source libraries. Ensure proper attribution when publishing results.
