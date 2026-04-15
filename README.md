@@ -1,521 +1,286 @@
-# Graph Neural Network for Drug Repurposing
+# PrimeKG Drug Repurposing with a Bias-Aware Residual GCN
 
-## Project Overview
+## Project Focus
+This README is intentionally ML-first and documents exactly what we implemented in the GCN pipeline.
 
-A full-stack **Graph Neural Network (GNN)** drug repurposing system built on the **PrimeKG Knowledge Graph**. The pipeline trains a leakage-safe, bias-aware GCN model to predict novel drug-disease associations, served through a **FastAPI** backend and visualized via a **React + Vite** frontend with interactive diagnostics.
+Backend/frontend exist for serving and visualization, but the core work is:
+- leakage-safe graph construction
+- disease-aware ranking with GCN embeddings
+- hybrid ranking + calibration losses
+- explicit hub-bias diagnostics and mitigation
 
-> **Key Contribution**: This project identifies and fixes critical hub bias in GNN-based drug repurposing — where high-degree drugs (like Dexamethasone) dominate predictions regardless of disease — through inverse-degree negative sampling, degree-aware scoring, and correlation regularization.
-
----
-
-## Table of Contents
-
-1. [Architecture](#architecture)
-2. [Dataset](#dataset)
-3. [Model Architecture](#model-architecture)
-4. [Anti-Bias Pipeline](#anti-bias-pipeline)
-5. [Training & Evaluation](#training--evaluation)
-6. [Backend API](#backend-api)
-7. [Frontend Dashboard](#frontend-dashboard)
-8. [Installation & Setup](#installation--setup)
-9. [Usage](#usage)
-10. [Results](#results)
-11. [File Structure](#file-structure)
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   GNN Drug Repurposing System                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. DATA PIPELINE                                                │
-│     └─ PrimeKG Knowledge Graph (Harvard Dataverse)               │
-│        ├─ ~130K nodes (drug, disease, protein, gene, etc.)       │
-│        ├─ ~4M edges (biomedical relationships)                   │
-│        └─ Standardized column mapping                            │
-│                                                                  │
-│  2. LEAKAGE-SAFE GRAPH CONSTRUCTION                              │
-│     ├─ Remove val/test drug-disease edges from adjacency         │
-│     ├─ Symmetric normalization: Â = D^(-½) A D^(-½)             │
-│     └─ Degree-aware inverse-sqrt negative sampling               │
-│                                                                  │
-│  3. RESIDUAL GCN MODEL (3-layer)                                 │
-│     ├─ Input GCN: hidden_dim → hidden_dim                        │
-│     ├─ 2× Residual GCN + LayerNorm + Dropout                    │
-│     ├─ Output GCN: hidden_dim → embedding_dim                   │
-│     └─ Link Predictor: [src, dst, src⊙dst, log_deg] → score    │
-│                                                                  │
-│  4. TRAINING LOOP                                                │
-│     ├─ BCE loss + degree correlation regularizer (λ=0.1)         │
-│     ├─ ReduceLROnPlateau scheduler + gradient clipping           │
-│     └─ Early stopping on validation MRR (patience=15)            │
-│                                                                  │
-│  5. EVALUATION SUITE                                             │
-│     ├─ AUC, AP, Hits@K, MRR, Precision@K, Recall@K              │
-│     ├─ Degree-stratified metrics (low/medium/high)               │
-│     ├─ Spearman ρ (degree vs. score correlation)                 │
-│     └─ Jaccard diversity (top-K overlap across diseases)         │
-│                                                                  │
-│  6. DEPLOYMENT                                                   │
-│     ├─ FastAPI backend (model inference + metrics API)            │
-│     └─ React frontend (3-tab dashboard)                          │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+## End-to-End Architecture
+```text
+PrimeKG CSV
+  -> column normalization + entity mapping
+  -> extract drug-disease relations by type
+      positives: indication, off-label use
+      typed negatives: contraindication
+  -> split positives/contra into train/val/test
+  -> build signed training graph
+      +1: non-drug-disease edges
+      +1: train therapeutic edges
+      -1: train contraindication edges
+  -> normalized sparse adjacency (for message passing)
+  -> Residual GCN encoder (node + type embeddings)
+  -> degree-aware link scorer
+  -> loss = BPR + BCE + degree-correlation regularization
+  -> eval: AUC/AP + ranking + bias/diversity metrics
+  -> FastAPI inference (optional debias reranking)
 ```
 
----
+## Dataset and Labeling Strategy
+Source: Harvard Dataverse PrimeKG (`https://dataverse.harvard.edu/api/access/datafile/6180620`).
 
-## Dataset
+We do not treat all drug-disease links as the same. We explicitly separate relation types:
+- Positive supervision: `indication`, `off-label use`
+- Negative supervision: `contraindication`
+- Unknown pairs: used as additional evaluation negatives (50% mix by default in val/test)
 
-### PrimeKG Knowledge Graph
+Latest run statistics from `models/training_metrics.json`:
 
-| Property | Value |
-|----------|-------|
-| **Source** | Harvard Dataverse |
-| **URL** | `https://dataverse.harvard.edu/api/access/datafile/6180620` |
-| **Format** | CSV (auto-downloaded on first run) |
-| **Nodes** | ~129K (drug, disease, protein, gene, anatomy, etc.) |
-| **Edges** | ~4M biomedical relationships |
-| **Drug-Disease Positives** | ~42,383 unique pairs |
+| Item | Value |
+| --- | --- |
+| Therapeutic positives (total across splits) | 11,708 |
+| Contraindication edges (total across splits) | 30,552 |
+| Conflicting treat+contra pairs removed | 123 |
+| Therapeutic drug whitelist | 2,074 drugs |
+| Total drug nodes in graph | 7,898 drugs |
+| Train/Val/Test positives | 9,368 / 1,170 / 1,170 |
+| Train/Val/Test negatives | 24,442 / 3,510 / 3,510 |
 
-### Entity Types
-- **Drug**: Chemical compounds with known pharmacological effects
-- **Disease**: Medical conditions and pathologies
-- **Protein/Gene**: Molecular targets and genetic information
+## How We Tackled Problems (Problem -> Solution)
+This is the actual decision path reflected in code.
 
-### Column Standardization
-The pipeline auto-detects column names across PrimeKG versions:
-- `x_id` / `x_index` → `source_id`
-- `x_type` / `source_type` → `source_type`
-- `y_id` / `y_index` → `target_id`
-- `y_type` / `target_type` → `target_type`
+| Problem observed | Why it mattered | What we changed |
+| --- | --- | --- |
+| Label leakage risk in message passing | If val/test drug-disease edges are in adjacency, model can indirectly "see answers" | Built adjacency from non-drug-disease edges + train-only therapeutic/contra edges |
+| Generic hubs dominating rankings | High-degree drugs get high scores for many diseases | Added degree-aware scorer features, degree-correlation penalty, and inference-time prior subtraction |
+| Binary classification alone was weak for ranking | AUC can look okay while top-k disease-specific ranking stays poor | Added BPR ranking loss as primary objective plus BCE for probability calibration |
+| Easy negatives gave weak learning signal | Model needs hard "looks plausible but wrong" negatives | Added periodic hard negative mining and mixed hard + random BPR pairs |
+| Non-therapeutic compounds surfaced as candidates | Many graph drug nodes are not practical therapeutics | Candidate whitelist built from indication/off-label/contra drug participation |
+| Contradictory labels exist in raw KG | Same pair marked as treat and contraindication creates noisy supervision | Detected and removed 123 conflicting pairs from both sets |
 
----
+## GCN Model Details
+Implementation: `gnn_drug_repurposing_improved.py`
 
-## Model Architecture
+### 1. Node encoding
+- Learned node embedding: `Embedding(num_nodes, hidden_dim)`
+- Learned type embedding: `Embedding(num_types, hidden_dim)`
+- Initial feature: `x0 = node_embed + type_embed`
 
-### 3-Layer Residual GCN
+### 2. Graph encoder
+- `GraphConv(hidden_dim -> hidden_dim)` + ReLU
+- 2 x ResidualGCN blocks:
+  - GraphConv(hidden_dim -> hidden_dim)
+  - LayerNorm
+  - ReLU + Dropout
+  - skip connection: `x + h`
+- Final `GraphConv(hidden_dim -> embedding_dim)`
 
-```
-Node Index ──→ Embedding(num_nodes, 128)  ─┐
-                                            ├──→ Add ──→ GCN_in(128→128) + ReLU
-Node Type ──→ Embedding(num_types, 128)  ──┘               │
-                                                            ▼
-                                                  ResidualGCN × 2
-                                                  ├─ GCN(128→128)
-                                                  ├─ LayerNorm
-                                                  ├─ ReLU + Dropout(0.2)
-                                                  └─ Skip Connection (x + h)
-                                                            │
-                                                            ▼
-                                                    GCN_out(128→64)
-                                                            │
-                                                     Node Embeddings (64-dim)
-```
+Default dimensions:
+- `hidden_dim = 128`
+- `embedding_dim = 64`
+- `dropout = 0.2`
 
-### Degree-Aware Link Predictor
+### 3. Signed normalized adjacency
+Training graph is signed (+1/-1). Normalization uses absolute values in degree term for stability:
+- signed edge weights are preserved in message passing
+- self-loops are added
 
-```
-Input: [z_src, z_dst, z_src ⊙ z_dst, log(deg_src), log(deg_dst)]
-       ─── 64 + 64 + 64 + 1 + 1 = 194 features ───
-                        │
-                Linear(194 → 64) + ReLU
-                        │
-                 BatchNorm1d(64)
-                        │
-                   Dropout(0.2)
-                        │
-                  Linear(64 → 1)
-                        │
-                     Logit Score
-```
+### 4. Link scorer
+For pair `(drug, disease)` features are:
+- drug embedding `z_src`
+- disease embedding `z_dst`
+- elementwise interaction `z_src * z_dst`
+- `log(deg_src)` and `log(deg_dst)`
 
-**Why degree features?** By giving the model explicit access to `log(degree)`, it can learn to discount the influence of node popularity rather than using it as a shortcut.
+MLP:
+- `Linear(3*embedding_dim + 2 -> embedding_dim)`
+- `ReLU -> BatchNorm1d -> Dropout`
+- `Linear(embedding_dim -> 1)` (logit)
 
-### Configuration
+## Loss Functions and Training Objective
+We train with a hybrid objective:
 
-| Parameter | Value |
-|-----------|-------|
-| Hidden Dimension | 128 |
-| Embedding Dimension | 64 |
-| GCN Layers | 3 (1 input + 2 residual) |
-| Dropout | 0.2 |
-| Learning Rate | 1e-3 (AdamW) |
-| Weight Decay | 1e-5 |
-| Negative Ratio | 3:1 |
-| Early Stopping Patience | 15 epochs |
-| Gradient Clip Norm | 1.0 |
-| Degree Correlation λ | 0.1 |
+`L = w_bpr * L_bpr + w_bce * L_bce + lambda_deg * L_deg_corr`
 
----
+Current weights:
+- `w_bpr = 1.0`
+- `w_bce = 0.3`
+- `lambda_deg = 0.02`
 
-## Anti-Bias Pipeline
+### A) BPR ranking loss (primary)
+For each disease, enforce positive drug score > negative drug score:
 
-### Critical Bugs Fixed from Original Model
+`L_bpr = - mean(log(sigmoid(s_pos - s_neg)))`
 
-| Bug | Problem | Fix |
-|-----|---------|-----|
-| **Test Edge Leakage** | Adjacency included test drug-disease edges during training — model saw answers | Removed val/test edges from message-passing graph |
-| **Uniform Negative Sampling** | `random.choice()` gave high-degree drugs too few negatives | Inverse-sqrt degree-weighted sampling: P(drug) ∝ degree^(-0.5) |
-| **1:1 Negative Ratio** | Equal positives and negatives; real space is >99% negative | 3:1 negative ratio |
-| **No Over-Smoothing Prevention** | 2-layer GCN without residuals; embeddings collapse | 3-layer GCN with skip connections + LayerNorm |
-| **No Early Stopping** | Fixed 100 epochs, no validation monitoring | Early stopping on val MRR with patience=15 |
-| **No LR Scheduling** | Constant 1e-3 for all epochs | ReduceLROnPlateau (factor=0.5, patience=5) |
-| **AUC-Only Evaluation** | Single metric misses hub bias | Full suite: AUC, AP, MRR, Hits@K, Spearman ρ, Jaccard |
+This directly optimizes ranking quality (MRR/Hits@k behavior), not just classification.
 
-### Countermeasures Applied
+### B) BCE calibration loss
+Standard binary cross-entropy on train positive + typed negative pairs:
 
-1. **Inverse-degree negative sampling** — High-degree drugs get proportionally more negatives
-2. **Degree correlation loss** — Penalty term: λ·|corr(scores, log_degree)| added to BCE
-3. **Degree-aware scoring** — Link predictor receives `log(degree)` as explicit features
-4. **Residual GCN** — Skip connections prevent over-smoothing of embeddings
-5. **Leakage-safe splits** — Val/test drug-disease edges removed from training adjacency
+`L_bce = BCEWithLogits(logits, labels)`
 
----
+This keeps output scores calibrated and usable as confidence-like probabilities.
 
-## Training & Evaluation
+### C) Degree-correlation regularizer
+Compute absolute correlation between predicted scores and log drug degree, then penalize it:
 
-### Data Splits
+`L_deg_corr = abs(corr(sigmoid(logits), log(degree_src)))`
 
-| Split | Positives | Negatives (3:1) |
-|-------|-----------|-----------------|
-| Train | 33,907 | 101,721 |
-| Validation | 4,238 | 12,714 |
-| Test | 4,238 | 12,714 |
+This pushes the model away from using degree as a shortcut.
 
-### Training Process
+### Optimizer and schedule
+- Optimizer: AdamW (`lr=1e-3`, `weight_decay=1e-5`)
+- LR scheduler: ReduceLROnPlateau on validation MRR
+- Gradient clipping: `max_norm=1.0`
+- Early stopping patience: `15` eval steps
+- Eval frequency: every `5` epochs
 
-```
-For each epoch:
-  1. Forward: encode(node_type_ids, adjacency) → embeddings
-  2. Score: link_predictor(src, dst, src⊙dst, log_deg) → logits
-  3. Loss: BCE(logits, labels) + λ·|corr(scores, degree)|
-  4. Backward: gradient clipping at norm=1.0
-  5. Optimize: AdamW step
-  6. Every 5 epochs: validate on held-out set
-  7. Track best val MRR → save checkpoint
-  8. Early stop if no improvement for 15 eval cycles
-```
+### Hard negative mining
+After warmup (`hard_neg_start_epoch=20`), every `10` epochs:
+- score candidate negatives for disease
+- pick top false-positive drugs (hard negatives)
+- mix with random negatives (`hard_neg_fraction=0.5`)
 
-### Evaluation Metrics
+## Hub Bias: Solved or Not?
+Short answer: partially mitigated, not fully solved.
 
-| Metric | Description |
-|--------|-------------|
-| **ROC-AUC** | Link prediction discrimination |
-| **Average Precision** | Ranking quality under class imbalance |
-| **MRR** | Mean reciprocal rank of true drugs |
-| **Hits@1/5/10** | Fraction of true drugs in top-K |
-| **Precision@K / Recall@K** | Per-disease ranking precision & recall |
-| **Spearman ρ** | Degree vs. score correlation (bias metric) |
-| **Jaccard Diversity** | Top-K overlap across diseases (diversity metric) |
-| **Degree-Stratified AUC** | AUC breakdown by drug degree bucket |
+Latest bias metrics:
 
-### Diagnostic Plots (saved to `models/plots/`)
+| Bias metric | Value | Interpretation |
+| --- | --- | --- |
+| Spearman rho(degree, mean score) | `-0.2123` | No longer strongly positive hub correlation |
+| Mean top-k Jaccard across diseases | `0.1591` | Better diversity overall |
+| P90 top-k Jaccard | `0.5385` | Some disease pairs still share too many drugs |
+| Top-1 mode fraction | `0.2667` | Same top drug still appears for ~26.7% diseases |
+| Most common top-1 drug | `Zinc acetate` | Residual popularity bias remains |
 
-| Plot | Purpose |
-|------|---------|
-| `training_curves.png` | Train/val loss + MRR over epochs |
-| `degree_distribution.png` | Drug degree histogram in PrimeKG |
-| `degree_vs_score.png` | Scatter of degree vs. mean predicted score |
-| `roc_pr_curves.png` | ROC and Precision-Recall curves on test set |
-| `degree_stratified_metrics.png` | AUC by degree bucket (low/medium/high) |
-| `topk_diversity.png` | Jaccard similarity distribution across disease pairs |
+Why "partial":
+- We reduced direct degree-score coupling.
+- But top-1 concentration is still high, so disease-specificity is not fully reliable at the very top.
 
----
+Inference also applies optional debias reranking in backend:
 
-## Backend API
+`rank_score = raw_score - alpha * global_prior_centered`
 
-### Technology: FastAPI + PyTorch
+where `global_prior_centered` is average drug score across sampled diseases, centered by global mean.
 
-The backend loads the trained model checkpoint, precomputes embeddings once at startup, and serves predictions via REST endpoints.
+## Results (Latest Saved Run)
+### Main metrics
+| Metric | Value |
+| --- | --- |
+| Best validation MRR | `0.0250` at epoch `60` |
+| Test loss | `0.6286` |
+| Test AUC | `0.7727` |
+| Test AP | `0.4937` |
+| Test MRR | `0.0299` |
+| Test Hits@1 | `0.0094` |
+| Test Hits@5 | `0.0368` |
+| Test Hits@10 | `0.0667` |
+| Test Precision@10 | `0.0126` |
+| Test Recall@10 | `0.0636` |
 
-### Endpoints
+### Degree-stratified test performance
+| Bucket | Count | AUC | AP |
+| --- | --- | --- | --- |
+| Low degree (`<= q33`, q33=290) | 1,597 | 0.7553 | 0.3542 |
+| Medium (`q33 < deg <= q66`, q66=1140.44) | 1,346 | 0.7663 | 0.5053 |
+| High (`> q66`) | 1,737 | 0.8437 | 0.7002 |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check + model loaded status |
-| `GET` | `/metrics` | Full training metrics JSON (config, test results, bias analysis, history) |
-| `GET` | `/plots-list` | List of available diagnostic plot filenames |
-| `GET` | `/plots/{filename}` | Static serving of plot images |
-| `POST` | `/predict` | Drug predictions for a disease query |
+Interpretation:
+- Performance is still better for high-degree drugs.
+- This confirms remaining long-tail difficulty even after debiasing work.
 
-### Prediction Request
+## Sample Testing (Qualitative)
+Provided sample output table:
 
-```json
-POST /predict
-{
-  "disease": "cancer",
-  "top_k": 12
-}
-```
+| Disease | Top 1 | Top 2 | Top 3 |
+| --- | --- | --- | --- |
+| Colonic Neoplasm | Butacaine | Zinc gluconate | Isoleucine |
+| Chronic Lymphocytic Leukemia / SLL | Cerliponase alfa | Tenonitrozole | Tavaborole |
+| Malignant Hypertension | Prednisolone | Cortisone acetate | Procarbazine |
+| Type 2 Diabetes Mellitus | Cortisone acetate | Prednisolone | Dexamethasone |
+| Sitosterolemia | Darbepoetin alfa | Cerliponase alfa | Tenonitrozole |
+| Insomnia | Darbepoetin alfa | Cortisone acetate | Prednisolone |
+| Lyme Disease | Cortisone acetate | Prednisolone | Procarbazine |
+| Multidrug-Resistant Tuberculosis | Quizartinib | Ampicillin | Uracil mustard |
+| HIV Infectious Disease | Dexamethasone | Cortisone acetate | Triamcinolone |
+| Acute Lymphoblastic Leukemia | Darbepoetin alfa | Procarbazine | Doxycycline |
 
-### Prediction Response
+## Why Some Predictions Look Wrong
+This is important and expected in KG-based repurposing.
 
-```json
-{
-  "disease": "malignant neoplasm of breast",
-  "targets": [
-    {"name": "TP53", "pdb_id": "1TUP", "url": "http://..."}
-  ],
-  "predictions": [
-    {
-      "drug_name": "Dexamethasone",
-      "gnn_score": 0.9821,
-      "degree": 742,
-      "degree_bucket": "high",
-      "ligand_url": null
-    }
-  ]
-}
-```
+### 1) Dataset incompleteness (major reason)
+In PrimeKG, missing edge does not mean true negative. Many drug-disease pairs are simply unlabeled.
 
----
+Effect:
+- model may rank biologically plausible but unvalidated or noisy candidates
+- evaluation with unknown negatives can penalize true-but-missing positives
 
-## Frontend Dashboard
+### 2) Relation granularity mismatch
+We train on relation types (`indication`, `off-label`, `contraindication`) but not dosage, disease stage, subtype, or patient context.
 
-### Technology: React 19 + Vite + TypeScript + Framer Motion
+Effect:
+- drugs useful in one subtype/context can be over-generalized to another
 
-A 3-tab dashboard with glassmorphism design and animated transitions:
+### 3) Strong neighborhood transfer from hubs
+Even after debiasing, high-connectivity anti-inflammatory/oncology-adjacent drugs can still transfer to many diseases.
 
-### Tab 1: Drug Discovery
-- Search bar for disease queries
-- Drug prediction cards with GNN score + degree info
-- Target protein visualization (3Dmol.js PDB viewer)
-- Optional 3D ligand structure viewer (SDF format)
+Effect:
+- repeated steroid-like or broad-acting drugs in unrelated conditions
 
-### Tab 2: Model Performance
-- Key metrics hero cards (Test AUC, AP, Best Epoch, MRR, Hits@10)
-- Training configuration table
-- All 6 diagnostic plots displayed in a responsive grid
+### 4) Candidate filtering changes what appears
+In API inference, defaults are:
+- `exclude_contraindicated = true`
+- `exclude_known_treatments = true`
 
-### Tab 3: Bias Analysis
-- Spearman ρ correlation card with severity coloring
-- Top-1 mode fraction (same drug ranking #1 across diseases)
-- Mean/P90 Jaccard similarity metrics
-- Degree-stratified AUC bar chart (low/medium/high)
-- Changelog of all anti-bias countermeasures implemented
+So approved first-line treatments are intentionally removed to surface novel candidates.
 
----
+Effect:
+- top predictions can look "wrong" clinically because known correct drugs were filtered out on purpose
 
-## Installation & Setup
+### 5) Limited therapeutic drug whitelist
+Only 2,074/7,898 drug nodes are used as therapeutic candidates. This improves realism but also narrows candidate diversity.
 
-### Prerequisites
+Effect:
+- long-tail diseases can map to suboptimal remaining candidates
 
-```
-Python 3.10+
-Node.js 18+
-```
+### 6) Weak supervision per disease
+Many diseases have few positive edges, making disease-specific ranking hard.
 
-### 1. Clone & Setup Backend
+Effect:
+- easier to overfit to broad global priors than fine disease signals
 
+## Backend and Frontend (Brief)
+- Backend: FastAPI serves `/predict`, `/metrics`, and plot endpoints; loads model once and precomputes embeddings.
+- Frontend: React/Vite app with discovery, performance, and bias tabs for interactive inspection.
+
+## Reproduce
+### Train
 ```bash
-cd backend
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 2. Train the Model
-
-```bash
-# From project root, with venv activated:
 python3 gnn_drug_repurposing_improved.py --device auto --epochs 200
-
-# Options:
-#   --hidden-dim 128     (default)
-#   --embedding-dim 64   (default)
-#   --negative-ratio 3.0 (default)
-#   --eval-every 5       (default)
-#   --run-tsne           (optional, uses extra memory)
 ```
 
-This produces artifacts in `models/`:
-- `gnn_drug_repurposing.pt` — Model checkpoint
-- `adjacency.pt` — Normalized adjacency matrix
-- `degrees.pt` — Node degree tensor
-- `metadata.pkl` — Node maps and entity names
-- `training_metrics.json` — All metrics and training history
-- `plots/` — 6 diagnostic PNG plots
-
-### 3. Start Backend
-
+### Backend
 ```bash
 cd backend
-source venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-### 4. Start Frontend
-
+### Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Open `http://localhost:5173` in browser.
-
-### Backend Dependencies (`backend/requirements.txt`)
-
-```
-fastapi
-uvicorn
-torch
-numpy
-pandas
-pydantic
-scikit-learn
-python-dotenv
-```
-
-### Frontend Dependencies
-
-```
-react, react-dom, axios, framer-motion, lucide-react, 3dmol, vite, typescript
-```
-
----
-
-## Usage
-
-### 1. Drug Discovery
-
-Open the frontend → **Drug Discovery** tab → type a disease name → click **Discover**.
-
-Example queries: `cancer`, `diabetes`, `anemia`, `leukemia`, `parkinson`
-
-### 2. Review Model Performance
-
-Click the **Model Performance** tab to see:
-- Test AUC, Average Precision, Best Epoch, MRR, Hits@10
-- Full training configuration
-- 6 diagnostic plots
-
-### 3. Analyze Bias
-
-Click **Bias Analysis** tab to see:
-- Spearman ρ (degree-score correlation)
-- Top-1 mode fraction
-- Jaccard diversity metrics
-- Degree-stratified AUC breakdown
-- Complete list of anti-bias countermeasures
-
----
-
-## Results
-
-### Training Results (200 epochs, early stopped at epoch 125)
-
-| Metric | Value |
-|--------|-------|
-| Test ROC-AUC | 0.994 |
-| Test Average Precision | 0.989 |
-| Test MRR | 0.025 |
-| Test Hits@10 | 5.8% |
-| Best Validation MRR | 0.029 (epoch 125) |
-
-### Bias Metrics
-
-| Metric | Value | Target | Status |
-|--------|-------|--------|--------|
-| Spearman ρ | 0.884 | < 0.40 | ⚠️ Remaining bias |
-| Mean Jaccard | 0.543 | < 0.25 | ⚠️ Moderate overlap |
-| Top-1 Mode Fraction | 36.7% | < 10% | ⚠️ Dexamethasone dominates |
-| P90 Jaccard | 0.818 | < 0.50 | ⚠️ High overlap at P90 |
-
-### Degree-Stratified AUC
-
-| Bucket | AUC | Count |
-|--------|-----|-------|
-| Low (degree ≤ 1) | 0.694 | 9,446 |
-| Medium (1 < degree ≤ 255) | 0.980 | 3,685 |
-| High (degree > 255) | 0.962 | 3,821 |
-
-> **Note**: Hub bias remains significant despite countermeasures. The low-degree AUC of 0.694 vs high-degree AUC of 0.962 shows the model still performs better for well-connected drugs. Further work on graph augmentation, attention-based aggregation, or contrastive learning could improve this.
-
----
-
-## File Structure
-
-```
-majorProj/
-├── gnn_drug_repurposing_improved.py   # Training pipeline (memory-optimized)
-├── gnn_drug_repurposing_old.py        # Original script (backup)
-├── evaluate_model_bias.py             # Standalone bias evaluation
-├── prepare_10_diseases.py             # Pre-compute disease assets
-├── README.md                          # This file
-│
-├── backend/
-│   ├── main.py                        # FastAPI server
-│   ├── requirements.txt               # Python dependencies
-│   ├── .env                           # BASE_URL config
-│   ├── run.sh                         # Startup script
-│   └── venv/                          # Python virtual environment
-│
-├── frontend/
-│   ├── src/
-│   │   ├── App.tsx                    # Main 3-tab dashboard
-│   │   ├── index.css                  # Design system (glassmorphism)
-│   │   ├── main.tsx                   # Entry point
-│   │   └── components/
-│   │       └── MolecularViewer.tsx    # 3Dmol.js wrapper
-│   ├── package.json
-│   ├── vite.config.ts
-│   └── .env                          # VITE_API_URL config
-│
-├── data/
-│   ├── primekg.csv                    # PrimeKG dataset (auto-downloaded)
-│   ├── pdb/                           # Protein structure files
-│   └── ligands/                       # Drug SDF files
-│
-├── models/
-│   ├── gnn_drug_repurposing.pt        # Trained model checkpoint
-│   ├── adjacency.pt                   # Sparse adjacency matrix
-│   ├── degrees.pt                     # Node degree tensor
-│   ├── metadata.pkl                   # Node maps + entity names
-│   ├── training_metrics.json          # Full metrics + history
-│   └── plots/                         # Diagnostic visualizations
-│       ├── training_curves.png
-│       ├── degree_distribution.png
-│       ├── degree_vs_score.png
-│       ├── roc_pr_curves.png
-│       ├── degree_stratified_metrics.png
-│       └── topk_diversity.png
-│
-└── backup/                            # Project backup
-```
-
----
-
-## Technical Notes
-
-### Memory Optimization
-The training script is optimized for systems with **8GB RAM**:
-- Raw DataFrame freed immediately after name extraction (~600MB saved)
-- Standardized DataFrame freed after node artifact construction
-- Edge index arrays freed after adjacency is built
-- Explicit `gc.collect()` at strategic points
-- Static adjacency used during training (no per-epoch rebuild)
-
-### Reproducibility
-- Seed: 42 (set for Python, NumPy, and PyTorch)
-- Fixed train/val/test splits via seeded RNG
-- Deterministic negative sampling
-
----
-
-## References
-
-- **PrimeKG**: Chandak et al., "Building a knowledge graph to enable precision medicine" (Scientific Data, 2023)
-- **GCN**: Kipf & Welling, "Semi-Supervised Classification with Graph Convolutional Networks" (ICLR 2017)
-- **Link Prediction**: Zhang & Chen, "Link Prediction Based on Graph Neural Networks" (NeurIPS 2018)
-- **DropEdge**: Rong et al., "DropEdge: Towards Deep Graph Convolutional Networks on Node Classification" (ICLR 2020)
-
----
-
-## License & Attribution
-
-This project uses publicly available datasets (PrimeKG from Harvard Dataverse) and open-source libraries. Ensure proper attribution when publishing results.
+## Artifacts
+Training outputs are saved under `models/`:
+- `gnn_drug_repurposing.pt`
+- `adjacency.pt`
+- `degrees.pt`
+- `metadata.pkl`
+- `training_metrics.json`
+- `plots/*.png`
