@@ -64,13 +64,14 @@ class TrainConfig:
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     negative_ratio: float = 3.0
+    eval_unknown_fraction: float = 0.5
 
     # p(drug) ∝ degree ** power ; -0.5 gives inverse-sqrt weighting.
-    negative_drug_weight_power: float = -0.5
+    negative_drug_weight_power: float = -0.25
 
     batch_size: int = 2048
     patience: int = 15
-    degree_corr_lambda: float = 0.1
+    degree_corr_lambda: float = 0.02
 
     # BPR loss configuration
     bpr_weight: float = 1.0          # Weight for BPR ranking loss
@@ -98,6 +99,7 @@ class NodeArtifacts:
     node_type_ids: torch.Tensor
     src_idx: np.ndarray
     tgt_idx: np.ndarray
+    relations: np.ndarray  # per-edge relation string
     drug_nodes: torch.Tensor
     disease_nodes: torch.Tensor
 
@@ -108,6 +110,12 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--negative-ratio", type=float, default=3.0)
+    parser.add_argument(
+        "--eval-unknown-fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of val/test negatives sampled from unknown (non-treat, non-contra) pairs.",
+    )
     parser.add_argument("--dropedge", type=float, default=0.2)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--embedding-dim", type=int, default=64)
@@ -122,6 +130,7 @@ def parse_args() -> TrainConfig:
         epochs=args.epochs,
         seed=args.seed,
         negative_ratio=args.negative_ratio,
+        eval_unknown_fraction=max(0.0, min(1.0, args.eval_unknown_fraction)),
         dropedge_rate=args.dropedge,
         hidden_dim=args.hidden_dim,
         embedding_dim=args.embedding_dim,
@@ -268,6 +277,7 @@ def build_node_artifacts(df: pd.DataFrame) -> NodeArtifacts:
 
     src_idx = src_keys.map(node_map).to_numpy(dtype=np.int64)
     tgt_idx = tgt_keys.map(node_map).to_numpy(dtype=np.int64)
+    relations = df["relation"].to_numpy(dtype=str)
 
     node_types = [key.split("::", 1)[0] for key in all_keys]
     type_to_idx = {node_type: i for i, node_type in enumerate(sorted(set(node_types)))}
@@ -293,20 +303,35 @@ def build_node_artifacts(df: pd.DataFrame) -> NodeArtifacts:
         node_type_ids=node_type_ids,
         src_idx=src_idx,
         tgt_idx=tgt_idx,
+        relations=relations,
         drug_nodes=drug_nodes,
         disease_nodes=disease_nodes,
     )
 
 
+# Therapeutic relation types — only these count as positive training targets.
+THERAPEUTIC_RELATIONS = {"indication", "off-label use"}
+CONTRAINDICATION_RELATIONS = {"contraindication"}
+
+
 def extract_drug_disease_edges(
     src_idx: np.ndarray,
     tgt_idx: np.ndarray,
+    relations: np.ndarray,
     node_types: Sequence[str],
-) -> Tuple[List[Tuple[int, int]], np.ndarray]:
-    is_drug_disease = np.zeros(len(src_idx), dtype=bool)
-    directed_pairs: Set[Tuple[int, int]] = set()
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], np.ndarray]:
+    """Separate drug-disease edges into therapeutic positives and contraindication negatives.
 
-    for i, (src, tgt) in enumerate(zip(src_idx, tgt_idx)):
+    Returns:
+        therapeutic_edges: (drug_idx, disease_idx) pairs with indication/off-label relation.
+        contraindication_edges: (drug_idx, disease_idx) pairs with contraindication relation.
+        is_drug_disease: boolean mask over all edges (True for any drug-disease edge).
+    """
+    is_drug_disease = np.zeros(len(src_idx), dtype=bool)
+    therapeutic_pairs: Set[Tuple[int, int]] = set()
+    contraindication_pairs: Set[Tuple[int, int]] = set()
+
+    for i, (src, tgt, rel) in enumerate(zip(src_idx, tgt_idx, relations)):
         src_type = node_types[int(src)]
         tgt_type = node_types[int(tgt)]
 
@@ -317,12 +342,134 @@ def extract_drug_disease_edges(
 
         if src_is_drug and tgt_is_disease:
             is_drug_disease[i] = True
-            directed_pairs.add((int(src), int(tgt)))
+            pair = (int(src), int(tgt))
         elif src_is_disease and tgt_is_drug:
             is_drug_disease[i] = True
-            directed_pairs.add((int(tgt), int(src)))
+            pair = (int(tgt), int(src))
+        else:
+            continue
 
-    return sorted(directed_pairs), is_drug_disease
+        rel_lower = str(rel).strip().lower()
+        if rel_lower in THERAPEUTIC_RELATIONS:
+            therapeutic_pairs.add(pair)
+        elif rel_lower in CONTRAINDICATION_RELATIONS:
+            contraindication_pairs.add(pair)
+        # else: ignore other drug-disease relation types
+
+    return sorted(therapeutic_pairs), sorted(contraindication_pairs), is_drug_disease
+
+
+def build_therapeutic_drug_set(
+    therapeutic_edges: Sequence[Tuple[int, int]],
+    contraindication_edges: Sequence[Tuple[int, int]],
+) -> torch.Tensor:
+    """Build a whitelist of drug node indices that appear in at least one
+    therapeutic (indication/off-label) edge OR contraindication edge.
+    The contraindication drugs are included because they are real pharmaceutical
+    compounds even though they are not indicated for that specific disease."""
+    therapeutic_drug_ids: Set[int] = set()
+    for drug_idx, _ in therapeutic_edges:
+        therapeutic_drug_ids.add(drug_idx)
+    # Also include drugs from contraindication edges — they are real drugs,
+    # just not the right treatment for that particular disease.
+    for drug_idx, _ in contraindication_edges:
+        therapeutic_drug_ids.add(drug_idx)
+
+    return torch.tensor(sorted(therapeutic_drug_ids), dtype=torch.long)
+
+
+def build_smart_negatives(
+    train_pos: List[Tuple[int, int]],
+    contraindication_edges: List[Tuple[int, int]],
+    therapeutic_drug_nodes: torch.Tensor,
+    disease_nodes_np: np.ndarray,
+    drug_probs: np.ndarray,
+    blocked_pairs: Set[Tuple[int, int]],
+    num_samples: int,
+    rng: np.random.Generator,
+) -> List[Tuple[int, int]]:
+    """Build smart negatives from three sources:
+
+    1. Contraindication negatives (40%): real drug-disease pairs where the drug
+       is contraindicated — teaches 'associated ≠ therapeutic'.
+    2. Cross-disease negatives (30%): drugs that treat disease A, used as
+       negatives for disease B — teaches disease-specificity.
+    3. Random therapeutic negatives (30%): random pairs from therapeutic drug
+       whitelist — provides baseline negative coverage.
+    """
+    negatives: List[Tuple[int, int]] = []
+    local_blocked: Set[Tuple[int, int]] = set()
+
+    # --- Source 1: Contraindication negatives (40%) ---
+    n_contra = int(num_samples * 0.4)
+    contra_available = [
+        (d, dis) for d, dis in contraindication_edges
+        if (d, dis) not in blocked_pairs
+    ]
+    if contra_available:
+        n_use = min(n_contra, len(contra_available))
+        chosen_idx = rng.choice(len(contra_available), size=n_use, replace=False)
+        for idx in chosen_idx:
+            pair = contra_available[idx]
+            if pair not in local_blocked:
+                local_blocked.add(pair)
+                negatives.append(pair)
+    print(f"    Smart negatives: {len(negatives)} contraindication")
+
+    # --- Source 2: Cross-disease negatives (30%) ---
+    n_cross = int(num_samples * 0.3)
+    # Group positive drugs by disease
+    disease_to_drugs: Dict[int, List[int]] = defaultdict(list)
+    for drug_idx, disease_idx in train_pos:
+        disease_to_drugs[disease_idx].append(drug_idx)
+
+    all_diseases = list(disease_to_drugs.keys())
+    cross_count = 0
+    attempts = 0
+    max_attempts = n_cross * 50
+    while cross_count < n_cross and attempts < max_attempts:
+        # Pick a random disease
+        disease_a = int(rng.choice(all_diseases))
+        disease_b = int(rng.choice(all_diseases))
+        if disease_a == disease_b:
+            attempts += 1
+            continue
+        # Pick a drug that treats disease_a and use it as negative for disease_b
+        drugs_for_a = disease_to_drugs[disease_a]
+        drug = int(rng.choice(drugs_for_a))
+        pair = (drug, disease_b)
+        if pair not in blocked_pairs and pair not in local_blocked:
+            local_blocked.add(pair)
+            negatives.append(pair)
+            cross_count += 1
+        attempts += 1
+    print(f"    Smart negatives: {cross_count} cross-disease")
+
+    # --- Source 3: Random therapeutic negatives (remaining) ---
+    n_random = num_samples - len(negatives)
+    therapeutic_np = therapeutic_drug_nodes.numpy()
+    random_count = 0
+    attempts = 0
+    max_attempts = n_random * 200
+    while random_count < n_random and attempts < max_attempts:
+        batch_size = min(max((n_random - random_count) * 4, 2048), 50000)
+        sampled_drugs = rng.choice(therapeutic_np, size=batch_size, replace=True)
+        sampled_diseases = rng.choice(disease_nodes_np, size=batch_size, replace=True)
+        for drug_idx, disease_idx in zip(sampled_drugs, sampled_diseases):
+            pair = (int(drug_idx), int(disease_idx))
+            attempts += 1
+            if pair in blocked_pairs or pair in local_blocked:
+                continue
+            local_blocked.add(pair)
+            negatives.append(pair)
+            random_count += 1
+            if random_count >= n_random:
+                break
+    print(f"    Smart negatives: {random_count} random therapeutic")
+
+    blocked_pairs.update(local_blocked)
+    print(f"    Total smart negatives: {len(negatives)}")
+    return negatives
 
 
 def split_positive_edges(
@@ -348,25 +495,142 @@ def split_positive_edges(
     return train_pos, val_pos, test_pos
 
 
+def sample_edges_to_target(
+    edges: Sequence[Tuple[int, int]],
+    target_count: int,
+    rng: np.random.Generator,
+    split_name: str,
+    relation_name: str,
+) -> List[Tuple[int, int]]:
+    """Sample without replacement from an edge pool (or keep all if target is large)."""
+    edge_list = list(edges)
+    if target_count <= 0:
+        print(
+            f"  {split_name}: requested {target_count} {relation_name} negatives; "
+            "using all available."
+        )
+        return edge_list
+
+    if target_count >= len(edge_list):
+        print(
+            f"  {split_name}: requested {target_count} {relation_name} negatives; "
+            f"using all {len(edge_list):,} available."
+        )
+        return edge_list
+
+    chosen_idx = rng.choice(len(edge_list), size=target_count, replace=False)
+    sampled = [edge_list[int(i)] for i in chosen_idx]
+    print(
+        f"  {split_name}: sampled {len(sampled):,} / {len(edge_list):,} "
+        f"{relation_name} negatives."
+    )
+    return sampled
+
+
+def compose_eval_negatives(
+    typed_edges: Sequence[Tuple[int, int]],
+    target_count: int,
+    unknown_fraction: float,
+    therapeutic_drug_nodes: torch.Tensor,
+    disease_nodes_np: np.ndarray,
+    drug_probs: np.ndarray,
+    blocked_known_pairs: Set[Tuple[int, int]],
+    rng: np.random.Generator,
+    split_name: str,
+) -> List[Tuple[int, int]]:
+    """Build evaluation negatives as a mix of typed contraindications and unknown pairs."""
+    n_unknown = int(round(target_count * unknown_fraction))
+    n_typed = max(target_count - n_unknown, 0)
+
+    typed_neg = sample_edges_to_target(
+        edges=typed_edges,
+        target_count=n_typed,
+        rng=rng,
+        split_name=split_name,
+        relation_name="contraindication",
+    )
+
+    # If typed pool is smaller than requested, fill the remainder with unknown negatives.
+    n_unknown += max(0, n_typed - len(typed_neg))
+    if n_unknown <= 0:
+        return typed_neg
+
+    blocked_for_unknown = set(blocked_known_pairs)
+    blocked_for_unknown.update(typed_neg)
+    unknown_neg = sample_negative_edges(
+        num_samples=n_unknown,
+        drug_nodes_np=therapeutic_drug_nodes.detach().cpu().numpy(),
+        disease_nodes_np=disease_nodes_np,
+        drug_probs=drug_probs,
+        blocked_pairs=blocked_for_unknown,
+        rng=rng,
+        split_name=f"{split_name}_unknown",
+    )
+    print(
+        f"  {split_name}: evaluation negatives = {len(typed_neg):,} contraindication + "
+        f"{len(unknown_neg):,} unknown"
+    )
+    return typed_neg + unknown_neg
+
+
+def group_drugs_by_disease(edges: Sequence[Tuple[int, int]]) -> Dict[int, List[int]]:
+    grouped: Dict[int, Set[int]] = defaultdict(set)
+    for drug_idx, disease_idx in edges:
+        grouped[int(disease_idx)].add(int(drug_idx))
+    return {disease_idx: sorted(drugs) for disease_idx, drugs in grouped.items()}
+
+
 def build_train_base_edge_index(
     src_idx: np.ndarray,
     tgt_idx: np.ndarray,
     is_drug_disease: np.ndarray,
     train_pos_edges: Sequence[Tuple[int, int]],
+    train_contra_edges: Sequence[Tuple[int, int]],
     device: torch.device,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     non_dd_src = src_idx[~is_drug_disease]
     non_dd_tgt = tgt_idx[~is_drug_disease]
 
-    train_drug = np.array([s for s, _ in train_pos_edges], dtype=np.int64)
-    train_disease = np.array([t for _, t in train_pos_edges], dtype=np.int64)
+    train_treat_drug = np.array([s for s, _ in train_pos_edges], dtype=np.int64)
+    train_treat_disease = np.array([t for _, t in train_pos_edges], dtype=np.int64)
+    train_contra_drug = np.array([s for s, _ in train_contra_edges], dtype=np.int64)
+    train_contra_disease = np.array([t for _, t in train_contra_edges], dtype=np.int64)
 
-    # Undirected message-passing graph: all non drug-disease edges + only TRAIN drug-disease edges.
-    base_src = np.concatenate([non_dd_src, non_dd_tgt, train_drug, train_disease])
-    base_tgt = np.concatenate([non_dd_tgt, non_dd_src, train_disease, train_drug])
+    # Signed message-passing graph:
+    # +1 for non-drug-disease structure and TREATS edges
+    # -1 for CONTRAINDICATION edges
+    src_parts: List[np.ndarray] = [
+        non_dd_src,
+        non_dd_tgt,
+        train_treat_drug,
+        train_treat_disease,
+        train_contra_drug,
+        train_contra_disease,
+    ]
+    tgt_parts: List[np.ndarray] = [
+        non_dd_tgt,
+        non_dd_src,
+        train_treat_disease,
+        train_treat_drug,
+        train_contra_disease,
+        train_contra_drug,
+    ]
+    weight_parts: List[np.ndarray] = [
+        np.ones_like(non_dd_src, dtype=np.float32),
+        np.ones_like(non_dd_tgt, dtype=np.float32),
+        np.ones_like(train_treat_drug, dtype=np.float32),
+        np.ones_like(train_treat_disease, dtype=np.float32),
+        -np.ones_like(train_contra_drug, dtype=np.float32),
+        -np.ones_like(train_contra_disease, dtype=np.float32),
+    ]
+
+    base_src = np.concatenate(src_parts)
+    base_tgt = np.concatenate(tgt_parts)
+    base_weight = np.concatenate(weight_parts)
 
     edge_index = torch.tensor(np.vstack([base_src, base_tgt]), dtype=torch.long, device=device)
-    return edge_index
+    edge_weight = torch.tensor(base_weight, dtype=torch.float, device=device)
+    return edge_index, edge_weight
 
 
 def compute_degrees(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -459,20 +723,30 @@ def drop_edge(edge_index: torch.Tensor, drop_prob: float, training: bool) -> tor
     return edge_index[:, mask]
 
 
-def build_normalized_adjacency(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+def build_normalized_adjacency(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    edge_weight: Optional[torch.Tensor] = None,
+    signed: bool = False,
+) -> torch.Tensor:
     src, dst = edge_index
+    if edge_weight is None:
+        edge_weight = torch.ones(src.shape[0], device=edge_index.device)
+    else:
+        edge_weight = edge_weight.to(edge_index.device)
     loop = torch.arange(num_nodes, device=edge_index.device)
+    loop_weight = torch.ones(num_nodes, device=edge_index.device)
 
     src_all = torch.cat([src, loop])
     dst_all = torch.cat([dst, loop])
-
-    values = torch.ones(src_all.shape[0], device=edge_index.device)
+    values_all = torch.cat([edge_weight, loop_weight])
 
     degree = torch.zeros(num_nodes, device=edge_index.device)
-    degree.scatter_add_(0, src_all, values)
+    degree_values = values_all.abs() if signed else values_all
+    degree.scatter_add_(0, src_all, degree_values)
 
     deg_inv_sqrt = degree.clamp(min=1).pow(-0.5)
-    norm_values = deg_inv_sqrt[src_all] * values * deg_inv_sqrt[dst_all]
+    norm_values = deg_inv_sqrt[src_all] * values_all * deg_inv_sqrt[dst_all]
 
     return torch.sparse_coo_tensor(
         torch.stack([src_all, dst_all]),
@@ -620,6 +894,7 @@ def build_bpr_pairs(
     neg_edges: List[Tuple[int, int]],
     neg_per_pos: int,
     rng: np.random.Generator,
+    allow_global_fallback: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build BPR training pairs: for each positive (drug, disease),
     sample neg_per_pos negative drugs for the SAME disease.
@@ -632,23 +907,28 @@ def build_bpr_pairs(
     disease_to_neg_drugs: Dict[int, List[int]] = defaultdict(list)
     for drug_idx, disease_idx in neg_edges:
         disease_to_neg_drugs[disease_idx].append(drug_idx)
-
-    # For diseases with no pre-sampled negatives, build a global fallback pool
-    all_neg_drugs = list(set(drug for drug, _ in neg_edges))
+    global_neg_pool = sorted({int(drug_idx) for drug_idx, _ in neg_edges})
 
     bpr_pos_list = []
     bpr_neg_list = []
 
     for drug_pos, disease_idx in pos_edges:
-        neg_pool = disease_to_neg_drugs.get(disease_idx, all_neg_drugs)
-        n_sample = min(neg_per_pos, len(neg_pool))
-        if n_sample == 0:
+        neg_pool = disease_to_neg_drugs.get(disease_idx, [])
+        # If a disease has no known contraindication edges in train,
+        # fall back to global contraindication drugs so BPR still gets signal.
+        if not neg_pool and allow_global_fallback:
+            neg_pool = global_neg_pool
+        if not neg_pool:
             continue
 
+        n_sample = min(neg_per_pos, len(neg_pool))
         chosen_neg_drugs = rng.choice(neg_pool, size=n_sample, replace=len(neg_pool) < n_sample)
         for drug_neg in chosen_neg_drugs:
             bpr_pos_list.append((drug_pos, disease_idx))
             bpr_neg_list.append((int(drug_neg), disease_idx))
+
+    if not bpr_pos_list:
+        return torch.zeros(2, 0, dtype=torch.long), torch.zeros(2, 0, dtype=torch.long)
 
     pos_pairs = torch.tensor(bpr_pos_list, dtype=torch.long).T  # [2, N]
     neg_pairs = torch.tensor(bpr_neg_list, dtype=torch.long).T  # [2, N]
@@ -667,6 +947,8 @@ def mine_hard_negatives(
     batch_size: int,
     max_diseases: int = 200,
     rng: Optional[np.random.Generator] = None,
+    candidate_neg_by_disease: Optional[Dict[int, List[int]]] = None,
+    candidate_global_neg_drugs: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Mine hard negatives: for each positive (drug, disease), find the
     highest-scoring negative drugs (false positives) under the current model.
@@ -685,16 +967,27 @@ def mine_hard_negatives(
     bpr_pos_list = []
     bpr_neg_list = []
 
-    drug_nodes_cpu = drug_nodes.cpu()
+    del disease_nodes  # Unused; kept in signature for backward compatibility.
+    all_drug_nodes = [int(x) for x in drug_nodes.detach().cpu().tolist()]
+    if candidate_global_neg_drugs is None:
+        candidate_global_neg_drugs = all_drug_nodes
 
     for disease_idx in disease_list:
         pos_drugs = disease_to_pos_drugs[disease_idx]
         if not pos_drugs:
             continue
 
-        # Score all drugs for this disease
-        disease_tensor = torch.full_like(drug_nodes, int(disease_idx))
-        pairs = torch.stack([drug_nodes, disease_tensor])  # [2, num_drugs]
+        if candidate_neg_by_disease is not None:
+            candidate_drugs = candidate_neg_by_disease.get(disease_idx, candidate_global_neg_drugs)
+            if not candidate_drugs:
+                continue
+        else:
+            candidate_drugs = all_drug_nodes
+
+        # Score candidate negative drugs for this disease
+        candidate_tensor = torch.tensor(candidate_drugs, dtype=torch.long, device=z.device)
+        disease_tensor = torch.full_like(candidate_tensor, int(disease_idx))
+        pairs = torch.stack([candidate_tensor, disease_tensor])  # [2, num_candidates]
 
         with torch.no_grad():
             logits = []
@@ -703,9 +996,8 @@ def mine_hard_negatives(
                 logits.append(model.score(z, batch, degrees))
             all_scores = torch.cat(logits).cpu()
 
-        # Mask out positive drugs (set their score to -inf so they aren't selected as negatives)
-        drug_nodes_list = drug_nodes_cpu.tolist()
-        for i, d in enumerate(drug_nodes_list):
+        # Mask out blocked/positive drugs so they are not selected as negatives
+        for i, d in enumerate(candidate_drugs):
             if (d, disease_idx) in blocked_pairs or d in pos_drugs:
                 all_scores[i] = float('-inf')
 
@@ -715,7 +1007,7 @@ def mine_hard_negatives(
             continue
 
         _, hard_indices = torch.topk(all_scores, k=int(n_hard))
-        hard_drug_nodes = [drug_nodes_list[i] for i in hard_indices.tolist()]
+        hard_drug_nodes = [candidate_drugs[i] for i in hard_indices.tolist()]
 
         # Assign hard negatives round-robin to positive drugs
         pos_drugs_list = list(pos_drugs)
@@ -1005,25 +1297,24 @@ def plot_training_curves(history: Dict[str, List[float]], output_path: Path) -> 
         return
 
     epochs = history["epoch"]
-    plt.figure(figsize=(10, 5))
-    plt.plot(epochs, history["train_loss"], label="Train Loss", color="#1f77b4")
-    plt.plot(epochs, history["val_loss"], label="Val Loss", color="#17becf")
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(epochs, history["train_loss"], label="Train Loss", color="#1f77b4")
+    ax1.plot(epochs, history["val_loss"], label="Val Loss", color="#17becf")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Training Curves")
 
-    ax2 = plt.gca().twinx()
+    ax2 = ax1.twinx()
     ax2.plot(epochs, history["val_mrr"], label="Val MRR", color="#d62728")
     ax2.set_ylabel("MRR")
 
-    plt.title("Training Curves")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-
-    lines, labels = plt.gca().get_legend_handles_labels()
+    lines, labels = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    plt.legend(lines + lines2, labels + labels2, loc="center right")
+    ax1.legend(lines + lines2, labels + labels2, loc="center right")
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=160)
-    plt.close()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
 
 
 def plot_degree_distribution(drug_degrees: np.ndarray, output_path: Path) -> None:
@@ -1228,12 +1519,32 @@ def main() -> None:
     gc.collect()
     num_nodes = len(node_artifacts.all_keys)
 
-    positive_edges, is_drug_disease = extract_drug_disease_edges(
+    therapeutic_edges, contraindication_edges, is_drug_disease = extract_drug_disease_edges(
         node_artifacts.src_idx,
         node_artifacts.tgt_idx,
+        node_artifacts.relations,
         node_artifacts.node_types,
     )
-    print(f"Total unique drug-disease positives: {len(positive_edges):,}")
+    conflict_pairs = sorted(set(therapeutic_edges).intersection(set(contraindication_edges)))
+    if conflict_pairs:
+        therapeutic_set = set(therapeutic_edges)
+        contraindication_set = set(contraindication_edges)
+        therapeutic_set.difference_update(conflict_pairs)
+        contraindication_set.difference_update(conflict_pairs)
+        therapeutic_edges = sorted(therapeutic_set)
+        contraindication_edges = sorted(contraindication_set)
+        print(
+            f"Removed conflicting treat+contra pairs from both classes: {len(conflict_pairs):,}"
+        )
+    print(f"Therapeutic positives (indication + off-label): {len(therapeutic_edges):,}")
+    print(f"Contraindication edges (typed negative supervision): {len(contraindication_edges):,}")
+
+    # Build whitelist of real pharmaceutical drugs (those with indication/off-label/contraindication)
+    therapeutic_drug_nodes = build_therapeutic_drug_set(therapeutic_edges, contraindication_edges)
+    print(f"Therapeutic drug whitelist: {len(therapeutic_drug_nodes):,} drugs (out of {len(node_artifacts.drug_nodes):,} total)")
+
+    # Use only therapeutic edges as positive training targets
+    positive_edges = therapeutic_edges
 
     train_pos, val_pos, test_pos = split_positive_edges(
         positive_edges,
@@ -1248,62 +1559,95 @@ def main() -> None:
         f"Test: {len(test_pos):,}"
     )
 
-    base_edge_index = build_train_base_edge_index(
+    # Split contraindication edges independently and use them as typed negatives.
+    train_contra, val_contra, test_contra = split_positive_edges(
+        contraindication_edges,
+        config.val_ratio,
+        config.test_ratio,
+        rng,
+    )
+    print(
+        "Split contraindications | "
+        f"Train: {len(train_contra):,}  "
+        f"Val: {len(val_contra):,}  "
+        f"Test: {len(test_contra):,}"
+    )
+
+    # Training negatives stay strictly typed (contraindications).
+    train_neg = sample_edges_to_target(
+        edges=train_contra,
+        target_count=int(len(train_pos) * config.negative_ratio),
+        rng=rng,
+        split_name="train",
+        relation_name="contraindication",
+    )
+
+    # Signed message-passing graph:
+    # +1 for TREATS, -1 for CONTRAINDICATION, +1 for non-drug-disease structure.
+    base_edge_index, base_edge_weight = build_train_base_edge_index(
         src_idx=node_artifacts.src_idx,
         tgt_idx=node_artifacts.tgt_idx,
         is_drug_disease=is_drug_disease,
         train_pos_edges=train_pos,
+        train_contra_edges=train_contra,
         device=device,
     )
     del is_drug_disease
     node_artifacts.src_idx = None
     node_artifacts.tgt_idx = None
+    node_artifacts.relations = None
 
-    static_adj = build_normalized_adjacency(base_edge_index, num_nodes).to(device)
+    static_adj = build_normalized_adjacency(
+        base_edge_index,
+        num_nodes,
+        edge_weight=base_edge_weight,
+        signed=True,
+    ).to(device)
     degree_tensor = compute_degrees(base_edge_index, num_nodes)
-    del base_edge_index  # No longer needed after adjacency is built
+    del base_edge_index, base_edge_weight  # No longer needed after adjacency is built
     gc.collect()
     print(f"Graph: {num_nodes:,} nodes | Memory freed after adjacency build")
 
+    # Unknown-negative sampling uses degree-aware drug sampling over therapeutic whitelist.
+    disease_nodes_np = node_artifacts.disease_nodes.detach().cpu().numpy()
     drug_sampling_probs = build_negative_sampling_probs(
         degrees=degree_tensor,
-        drug_nodes=node_artifacts.drug_nodes.to(device),
+        drug_nodes=therapeutic_drug_nodes.to(device),
         power=config.negative_drug_weight_power,
     )
 
+    # Block all known therapeutic positives (across splits) so hard negatives
+    # can never include a known treatment edge.
     blocked_pairs: Set[Tuple[int, int]] = set(positive_edges)
-    drug_nodes_np = node_artifacts.drug_nodes.detach().cpu().numpy()
-    disease_nodes_np = node_artifacts.disease_nodes.detach().cpu().numpy()
+    blocked_known_pairs = set(positive_edges).union(set(contraindication_edges))
 
-    train_neg = sample_negative_edges(
-        num_samples=int(len(train_pos) * config.negative_ratio),
-        drug_nodes_np=drug_nodes_np,
+    val_neg = compose_eval_negatives(
+        typed_edges=val_contra,
+        target_count=int(len(val_pos) * config.negative_ratio),
+        unknown_fraction=config.eval_unknown_fraction,
+        therapeutic_drug_nodes=therapeutic_drug_nodes,
         disease_nodes_np=disease_nodes_np,
         drug_probs=drug_sampling_probs,
-        blocked_pairs=blocked_pairs,
-        rng=rng,
-        split_name="train",
-    )
-    val_neg = sample_negative_edges(
-        num_samples=int(len(val_pos) * config.negative_ratio),
-        drug_nodes_np=drug_nodes_np,
-        disease_nodes_np=disease_nodes_np,
-        drug_probs=drug_sampling_probs,
-        blocked_pairs=blocked_pairs,
+        blocked_known_pairs=blocked_known_pairs,
         rng=rng,
         split_name="val",
     )
-    test_neg = sample_negative_edges(
-        num_samples=int(len(test_pos) * config.negative_ratio),
-        drug_nodes_np=drug_nodes_np,
+    test_neg = compose_eval_negatives(
+        typed_edges=test_contra,
+        target_count=int(len(test_pos) * config.negative_ratio),
+        unknown_fraction=config.eval_unknown_fraction,
+        therapeutic_drug_nodes=therapeutic_drug_nodes,
         disease_nodes_np=disease_nodes_np,
         drug_probs=drug_sampling_probs,
-        blocked_pairs=blocked_pairs,
+        blocked_known_pairs=blocked_known_pairs,
         rng=rng,
         split_name="test",
     )
-    del drug_sampling_probs, drug_nodes_np, disease_nodes_np
-    gc.collect()
+    val_contra_set = set(val_contra)
+    test_contra_set = set(test_contra)
+    val_neg_typed = sum(1 for pair in val_neg if pair in val_contra_set)
+    test_neg_typed = sum(1 for pair in test_neg if pair in test_contra_set)
+    del drug_sampling_probs
 
     train_pairs, train_labels = create_pair_tensors(train_pos, train_neg, device)
     val_pairs, val_labels = create_pair_tensors(val_pos, val_neg, device)
@@ -1316,12 +1660,13 @@ def main() -> None:
         f"Test: {test_pairs.shape[1]:,}"
     )
 
-    # Build initial BPR pairs (random negatives) — hard negatives added later
+    # Build initial BPR pairs from typed contraindication negatives.
     bpr_pos_pairs, bpr_neg_pairs = build_bpr_pairs(
         pos_edges=train_pos,
         neg_edges=train_neg,
         neg_per_pos=config.bpr_neg_per_pos,
         rng=rng,
+        allow_global_fallback=True,
     )
     bpr_pos_pairs = bpr_pos_pairs.to(device)
     bpr_neg_pairs = bpr_neg_pairs.to(device)
@@ -1354,6 +1699,9 @@ def main() -> None:
     node_type_ids = node_artifacts.node_type_ids.to(device)
     drug_nodes_device = node_artifacts.drug_nodes.to(device)
     disease_nodes_device = node_artifacts.disease_nodes.to(device)
+    therapeutic_drug_nodes_device = therapeutic_drug_nodes.to(device)
+    train_neg_by_disease = group_drugs_by_disease(train_neg)
+    global_train_neg_drugs = sorted({int(drug_idx) for drug_idx, _ in train_neg})
 
     history: Dict[str, List[float]] = defaultdict(list)
 
@@ -1376,13 +1724,15 @@ def main() -> None:
                 model=model,
                 z=z_for_mining,
                 pos_edges=train_pos,
-                drug_nodes=drug_nodes_device,
+                drug_nodes=therapeutic_drug_nodes_device,
                 disease_nodes=disease_nodes_device,
                 degrees=degree_tensor,
                 blocked_pairs=blocked_pairs,
                 neg_per_pos=config.bpr_neg_per_pos,
                 batch_size=config.batch_size,
                 rng=rng,
+                candidate_neg_by_disease=train_neg_by_disease,
+                candidate_global_neg_drugs=global_train_neg_drugs,
             )
             if hard_pos.shape[1] > 0:
                 hard_pos = hard_pos.to(device)
@@ -1407,10 +1757,14 @@ def main() -> None:
         # ── Forward pass ──
         z_train = model.encode(node_type_ids, static_adj)
 
-        # BPR ranking loss: score(pos_drug) should exceed score(neg_drug) for same disease
-        bpr_pos_scores = model.score(z_train, bpr_pos_mixed, degree_tensor)
-        bpr_neg_scores = model.score(z_train, bpr_neg_mixed, degree_tensor)
-        loss_bpr = bpr_loss(bpr_pos_scores, bpr_neg_scores)
+        # BPR ranking loss: score(pos_drug) should exceed score(neg_drug) for same disease.
+        # If typed negatives are unavailable for this batch, skip BPR safely.
+        if bpr_pos_mixed.shape[1] == 0:
+            loss_bpr = torch.tensor(0.0, device=device)
+        else:
+            bpr_pos_scores = model.score(z_train, bpr_pos_mixed, degree_tensor)
+            bpr_neg_scores = model.score(z_train, bpr_neg_mixed, degree_tensor)
+            loss_bpr = bpr_loss(bpr_pos_scores, bpr_neg_scores)
 
         # BCE calibration loss (keeps scores calibrated 0-1)
         train_logits = model.score(z_train, train_pairs, degree_tensor)
@@ -1454,7 +1808,7 @@ def main() -> None:
                 model=model,
                 z=z_eval,
                 positive_edges=val_pos,
-                drug_nodes=drug_nodes_device,
+                drug_nodes=therapeutic_drug_nodes_device,
                 degrees=degree_tensor,
                 top_k=config.ranking_k,
                 batch_size=config.batch_size,
@@ -1546,7 +1900,7 @@ def main() -> None:
         model=model,
         z=z_best,
         positive_edges=test_pos,
-        drug_nodes=drug_nodes_device,
+        drug_nodes=therapeutic_drug_nodes_device,
         degrees=degree_tensor,
         top_k=config.ranking_k,
         batch_size=config.batch_size,
@@ -1556,13 +1910,13 @@ def main() -> None:
         labels_np=test_labels_np,
         probs_np=test_probs_np,
         degrees=degree_tensor,
-        drug_nodes=drug_nodes_device,
+        drug_nodes=therapeutic_drug_nodes_device,
     )
 
     spearman_metrics, drug_degrees, mean_scores = compute_degree_score_bias(
         model=model,
         z=z_best,
-        drug_nodes=drug_nodes_device,
+        drug_nodes=therapeutic_drug_nodes_device,
         disease_nodes=disease_nodes_device,
         degrees=degree_tensor,
         batch_size=config.batch_size,
@@ -1573,7 +1927,7 @@ def main() -> None:
     diversity_metrics, jaccard_values, disease_topk = compute_topk_diversity(
         model=model,
         z=z_best,
-        drug_nodes=drug_nodes_device,
+        drug_nodes=therapeutic_drug_nodes_device,
         disease_nodes=disease_nodes_device,
         degrees=degree_tensor,
         top_k=config.ranking_k,
@@ -1607,6 +1961,11 @@ def main() -> None:
         "type_to_idx": node_artifacts.type_to_idx,
         "drug_nodes": node_artifacts.drug_nodes.detach().cpu().tolist(),
         "disease_nodes": node_artifacts.disease_nodes.detach().cpu().tolist(),
+        "therapeutic_drug_nodes": therapeutic_drug_nodes.detach().cpu().tolist(),
+        "therapeutic_edges": [(int(d), int(dis)) for d, dis in positive_edges],
+        "contraindication_edges": [(int(d), int(dis)) for d, dis in contraindication_edges],
+        "therapeutic_by_disease": group_drugs_by_disease(positive_edges),
+        "contraindications_by_disease": group_drugs_by_disease(contraindication_edges),
         "disease_id_to_name": disease_id_to_name,
         "drug_id_to_name": drug_id_to_name,
     }
@@ -1622,6 +1981,17 @@ def main() -> None:
             "train_neg": len(train_neg),
             "val_neg": len(val_neg),
             "test_neg": len(test_neg),
+            "val_neg_typed_contra": val_neg_typed,
+            "val_neg_unknown": len(val_neg) - val_neg_typed,
+            "test_neg_typed_contra": test_neg_typed,
+            "test_neg_unknown": len(test_neg) - test_neg_typed,
+            "train_contra_pool": len(train_contra),
+            "val_contra_pool": len(val_contra),
+            "test_contra_pool": len(test_contra),
+            "therapeutic_drugs": len(therapeutic_drug_nodes),
+            "total_drugs": len(node_artifacts.drug_nodes),
+            "contraindication_edges": len(contraindication_edges),
+            "conflicting_treat_contra_removed": len(conflict_pairs),
         },
         "best": {
             "best_epoch": best_epoch,
@@ -1652,7 +2022,7 @@ def main() -> None:
     if plt is None:
         print("matplotlib is not installed; skipping all plot generation.")
 
-    drug_degrees_np = degree_tensor[drug_nodes_device].detach().cpu().numpy()
+    drug_degrees_np = degree_tensor[therapeutic_drug_nodes_device].detach().cpu().numpy()
 
     plot_training_curves(history, config.plots_dir / "training_curves.png")
     plot_degree_distribution(drug_degrees_np, config.plots_dir / "degree_distribution.png")

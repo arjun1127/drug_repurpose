@@ -24,15 +24,41 @@ interface TargetProtein {
 interface Prediction {
   drug_name: string;
   gnn_score: number;
+  rank_score?: number;
+  global_prior?: number;
   degree: number;
   degree_bucket: 'low' | 'medium' | 'high' | 'unknown';
   ligand_url?: string;
 }
 
+interface DiseaseCandidate {
+  disease_node_idx: number;
+  name: string;
+  match_type: 'exact' | 'contains' | 'fuzzy';
+  match_score: number;
+}
+
 interface ResultsResponse {
   disease: string;
+  selected_disease_node_idx?: number;
+  disease_candidates?: DiseaseCandidate[];
+  matched_query?: string;
+  match_type?: string;
+  match_score?: number;
   targets: TargetProtein[];
   predictions: Prediction[];
+  therapeutic_drug_count?: number;
+  candidate_count_after_filters?: number;
+  filtered_out_count?: number;
+  filter_settings?: {
+    exclude_contraindicated: boolean;
+    exclude_known_treatments: boolean;
+  };
+  rerank_settings?: {
+    use_debias_rerank: boolean;
+    debias_alpha: number;
+    prior_sampled_diseases: number;
+  };
 }
 
 interface TrainingMetrics {
@@ -132,20 +158,22 @@ function App() {
     setOpenViewers(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!query.trim()) return;
-
+  const runPrediction = async (diseaseQuery: string, diseaseNodeIdx?: number) => {
     setLoading(true);
     setError('');
-    setResults(null);
     setOpenViewers({});
     setActiveTarget(null);
 
     try {
       const response = await axios.post(`${API_URL}/predict`, {
-        disease: query,
-        top_k: 12
+        disease: diseaseQuery,
+        top_k: 12,
+        disease_node_idx: diseaseNodeIdx,
+        exclude_contraindicated: true,
+        exclude_known_treatments: true,
+        use_debias_rerank: true,
+        debias_alpha: 0.35,
+        candidate_limit: 8,
       });
       setResults(response.data);
       if (response.data.targets?.length > 0) {
@@ -159,6 +187,14 @@ function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!query.trim()) return;
+
+    setResults(null);
+    await runPrediction(query.trim());
   };
 
   const getScoreColor = (score: number) => {
@@ -274,7 +310,54 @@ function App() {
                   <h2 className="results-title">
                     Results for <span className="results-disease-name">{results.disease}</span>
                   </h2>
+                  {results.match_type && (
+                    <div style={{ marginTop: '0.75rem', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                      Match: <strong>{results.match_type}</strong> ({fmt(results.match_score ?? 0, 2)})
+                      {results.selected_disease_node_idx != null && (
+                        <span> | node {results.selected_disease_node_idx}</span>
+                      )}
+                    </div>
+                  )}
+                  {results.filter_settings && (
+                    <div style={{ marginTop: '0.35rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                      Candidates: {results.candidate_count_after_filters ?? '—'} / {results.therapeutic_drug_count ?? '—'} after filters
+                      {results.rerank_settings?.use_debias_rerank && (
+                        <span> | Debias rerank α={results.rerank_settings.debias_alpha} (prior diseases={results.rerank_settings.prior_sampled_diseases})</span>
+                      )}
+                    </div>
+                  )}
                 </div>
+
+                {results.disease_candidates && results.disease_candidates.length > 1 && (
+                  <div style={{ marginBottom: '1.5rem', padding: '1rem', background: 'rgba(30, 41, 59, 0.35)', borderRadius: '10px', border: '1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '0.6rem' }}>
+                      Pick a specific disease node:
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                      {results.disease_candidates.map((candidate) => {
+                        const selected = candidate.disease_node_idx === results.selected_disease_node_idx;
+                        return (
+                          <button
+                            key={`${candidate.disease_node_idx}-${candidate.name}`}
+                            onClick={() => runPrediction(results.matched_query || query.trim(), candidate.disease_node_idx)}
+                            disabled={loading}
+                            style={{
+                              padding: '0.4rem 0.7rem',
+                              borderRadius: '999px',
+                              border: selected ? '1px solid #60a5fa' : '1px solid rgba(255,255,255,0.15)',
+                              background: selected ? 'rgba(59,130,246,0.22)' : 'rgba(255,255,255,0.03)',
+                              color: '#e2e8f0',
+                              cursor: 'pointer',
+                              fontSize: '0.82rem',
+                            }}
+                          >
+                            {candidate.name} [{candidate.match_type}:{fmt(candidate.match_score, 2)}]
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* Target Proteins */}
                 {results.targets?.length > 0 && activeTarget && (
@@ -334,6 +417,12 @@ function App() {
                               style={{ width: `${pred.gnn_score * 100}%`, background: getScoreColor(pred.gnn_score) }}
                             ></div>
                           </div>
+                          {pred.rank_score != null && (
+                            <div style={{ marginTop: '0.4rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                              Rerank score: {pred.rank_score.toFixed(4)}
+                              {pred.global_prior != null && ` | prior: ${pred.global_prior.toFixed(4)}`}
+                            </div>
+                          )}
                         </div>
 
                         {/* Degree Info */}
@@ -424,7 +513,7 @@ function App() {
                   <motion.div className="stat-card" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.15 }}>
                     <div className="stat-value">{fmt(metrics.test.test_ap, 3)}</div>
                     <div className="stat-label">Test Avg Precision</div>
-                    <div className="stat-sublabel">Ranking quality</div>
+                    <div className="stat-sublabel">Binary precision-recall</div>
                   </motion.div>
                   <motion.div className="stat-card" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.2 }}>
                     <div className="stat-value">{metrics.best.best_epoch}</div>
@@ -440,6 +529,11 @@ function App() {
                     <div className="stat-value">{pct(metrics.test['test_hits@10'])}</div>
                     <div className="stat-label">Test Hits@10</div>
                     <div className="stat-sublabel">True drug in top 10</div>
+                  </motion.div>
+                  <motion.div className="stat-card" initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ delay: 0.35 }}>
+                    <div className="stat-value">{fmt(metrics.test.test_mrr, 4)}</div>
+                    <div className="stat-label">Test MRR</div>
+                    <div className="stat-sublabel">Primary ranking metric</div>
                   </motion.div>
                 </div>
 
@@ -458,13 +552,16 @@ function App() {
                     <tr><td>Learning Rate</td><td>{metrics.config.lr}</td></tr>
                     <tr><td>Weight Decay</td><td>{metrics.config.weight_decay}</td></tr>
                     <tr><td>Negative Ratio</td><td>{metrics.config.negative_ratio}:1</td></tr>
-                    <tr><td>Neg Sampling</td><td>Inv-sqrt degree weighted</td></tr>
+                    <tr><td>Eval Unknown Fraction</td><td>{metrics.config.eval_unknown_fraction ?? '—'}</td></tr>
                     <tr><td>Early Stopping Patience</td><td>{metrics.config.patience} epochs</td></tr>
                     <tr><td>LR Scheduler</td><td>ReduceLROnPlateau (factor={metrics.config.lr_scheduler_factor})</td></tr>
                     <tr><td>Degree Correlation λ</td><td>{metrics.config.degree_corr_lambda}</td></tr>
                     <tr><td>Train Positives</td><td>{metrics.splits.train_pos.toLocaleString()}</td></tr>
                     <tr><td>Train Negatives</td><td>{metrics.splits.train_neg.toLocaleString()}</td></tr>
                     <tr><td>Val / Test Positives</td><td>{metrics.splits.val_pos.toLocaleString()} / {metrics.splits.test_pos.toLocaleString()}</td></tr>
+                    <tr><td>Val Negatives (typed / unknown)</td><td>{(metrics.splits.val_neg_typed_contra ?? 0).toLocaleString()} / {(metrics.splits.val_neg_unknown ?? 0).toLocaleString()}</td></tr>
+                    <tr><td>Test Negatives (typed / unknown)</td><td>{(metrics.splits.test_neg_typed_contra ?? 0).toLocaleString()} / {(metrics.splits.test_neg_unknown ?? 0).toLocaleString()}</td></tr>
+                    <tr><td>Conflict Pairs Removed</td><td>{(metrics.splits.conflicting_treat_contra_removed ?? 0).toLocaleString()}</td></tr>
                   </tbody>
                 </table>
 
@@ -523,8 +620,8 @@ function App() {
                 {/* Bias Metrics Cards */}
                 <h3 className="section-title"><Shield size={20} /> Hub Bias Diagnostics</h3>
                 <p className="section-subtitle">
-                  Hub bias occurs when the model predicts high-degree (highly connected) drugs for every disease,
-                  regardless of the actual biological relationship. These metrics quantify the bias level.
+                  Current run bias snapshot from the latest checkpoint. Lower overlap and lower degree-correlation are better,
+                  but strong novelty still depends on ranking quality (MRR / Hits@K), not AUC alone.
                 </p>
 
                 <div className="bias-grid">
@@ -534,10 +631,12 @@ function App() {
                       {fmt(metrics.bias.spearman_rho, 3)}
                     </div>
                     <div className="bias-desc">
-                      Correlation between drug degree and predicted score. Ideal: &lt; 0.3.
+                      Correlation between drug degree and average predicted score. Lower is better.
                       {metrics.bias.spearman_rho > 0.5
                         ? ' ⚠️ Significant hub bias remains — high-degree drugs dominate predictions.'
-                        : ' ✅ Hub bias is within acceptable range.'}
+                        : metrics.bias.spearman_rho > 0.3
+                        ? ' ⚠️ Moderate hub bias remains.'
+                        : ' ✅ Hub bias is currently controlled.'}
                     </div>
                   </motion.div>
 
@@ -547,7 +646,7 @@ function App() {
                       {pct(metrics.bias.top1_mode_fraction)}
                     </div>
                     <div className="bias-desc">
-                      Fraction of diseases where the same drug ({metrics.bias.top1_mode_drug_name}) ranks #1. Ideal: &lt; 10%.
+                      Fraction of sampled diseases where the same drug ({metrics.bias.top1_mode_drug_name}) ranks #1.
                     </div>
                   </motion.div>
 
@@ -557,7 +656,7 @@ function App() {
                       {fmt(metrics.bias.mean_jaccard, 3)}
                     </div>
                     <div className="bias-desc">
-                      Average top-K overlap across disease pairs. Lower means more diverse predictions. Ideal: &lt; 0.25.
+                      Average top-K overlap across disease pairs. Lower means better disease-specific diversity.
                     </div>
                   </motion.div>
 
@@ -609,44 +708,36 @@ function App() {
 
                 {/* What Was Done */}
                 <h3 className="section-title"><CheckCircle size={20} /> Anti-Bias Countermeasures Applied</h3>
-                <p className="section-subtitle">Changes implemented in this training pipeline to mitigate hub bias.</p>
+                <p className="section-subtitle">Current pipeline controls applied in this run.</p>
 
                 <ul className="changelog">
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Test edge leakage fix:</strong> Removed val/test drug-disease edges from the training adjacency matrix. The model no longer sees test answers during training.</span>
+                    <span><strong>Signed edge message passing:</strong> TREATS edges contribute positive signal and CONTRAINDICATION edges contribute negative signal in graph propagation.</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Inverse-degree negative sampling:</strong> Negatives are now sampled proportional to 1/√(degree), so high-degree drugs receive proportionally more negatives.</span>
+                    <span><strong>Conflict cleanup:</strong> Removed {metrics.splits.conflicting_treat_contra_removed ?? 0} pairs that had both treat and contraindication labels.</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>{metrics.config.negative_ratio}:1 negative ratio:</strong> Increased from 1:1 to better reflect the true sparsity of drug-disease space (&gt;99% negative).</span>
+                    <span><strong>Typed training negatives:</strong> Train negatives come from contraindications ({metrics.splits.train_contra_pool?.toLocaleString?.() ?? '—'} pool).</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Residual GCN layers:</strong> 3-layer GCN with skip connections and LayerNorm to prevent over-smoothing of embeddings.</span>
+                    <span><strong>Realistic evaluation negatives:</strong> Val/Test negatives mix contraindications and unknown pairs ({metrics.splits.val_neg_typed_contra ?? 0}/{metrics.splits.val_neg_unknown ?? 0} in val).</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Degree-aware scoring:</strong> The link predictor receives log(degree) as an explicit feature, allowing the model to discount degree influence.</span>
+                    <span><strong>Global-prior de-bias reranking:</strong> Inference ranks by score minus centered drug prior to reduce repeated cross-disease winners.</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Degree correlation loss (λ={metrics.config.degree_corr_lambda}):</strong> A regularization penalty that penalizes correlation between predicted scores and node degree.</span>
+                    <span><strong>Disease disambiguation:</strong> API returns ranked disease-node candidates; frontend lets you choose exact node before final ranking.</span>
                   </li>
                   <li>
                     <span className="change-icon">✓</span>
-                    <span><strong>Early stopping (patience={metrics.config.patience}):</strong> Monitored on validation MRR to prevent overfitting to degree patterns.</span>
-                  </li>
-                  <li>
-                    <span className="change-icon">✓</span>
-                    <span><strong>LR scheduling:</strong> ReduceLROnPlateau with factor={metrics.config.lr_scheduler_factor} and gradient clipping at {metrics.config.grad_clip_norm}.</span>
-                  </li>
-                  <li>
-                    <span className="change-icon">✓</span>
-                    <span><strong>Comprehensive evaluation:</strong> ROC-AUC, AP, Hits@K, MRR, degree-stratified AUC, Spearman ρ, and Jaccard diversity — not just AUC alone.</span>
+                    <span><strong>Regularization + ranking objective:</strong> BPR + BCE + degree-correlation penalty (λ={metrics.config.degree_corr_lambda}) with early stopping on MRR.</span>
                   </li>
                 </ul>
               </>
