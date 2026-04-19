@@ -52,14 +52,15 @@ Latest run statistics from `models/training_metrics.json`:
 ## How We Tackled Problems (Problem -> Solution)
 This is the actual decision path reflected in code.
 
-| Problem observed | Why it mattered | What we changed |
-| --- | --- | --- |
 | Label leakage risk in message passing | If val/test drug-disease edges are in adjacency, model can indirectly "see answers" | Built adjacency from non-drug-disease edges + train-only therapeutic/contra edges |
 | Generic hubs dominating rankings | High-degree drugs get high scores for many diseases | Added degree-aware scorer features, degree-correlation penalty, and inference-time prior subtraction |
 | Binary classification alone was weak for ranking | AUC can look okay while top-k disease-specific ranking stays poor | Added BPR ranking loss as primary objective plus BCE for probability calibration |
 | Easy negatives gave weak learning signal | Model needs hard "looks plausible but wrong" negatives | Added periodic hard negative mining and mixed hard + random BPR pairs |
 | Non-therapeutic compounds surfaced as candidates | Many graph drug nodes are not practical therapeutics | Candidate whitelist built from indication/off-label/contra drug participation |
 | Contradictory labels exist in raw KG | Same pair marked as treat and contraindication creates noisy supervision | Detected and removed 123 conflicting pairs from both sets |
+| Explainability gap | Model gives scores but no "why" | Implemented `/explain` endpoint with L2/L3 path search between drug and disease |
+| Domain-specific filtering | Biologists may want to exclude certain classes (e.g. topical only) | Added category-based filtering using `DRUG_CATEGORIES` mapping |
+| Rigid hub-bias penalty | Static penalty can over-penalize high-degree drugs for some users | Introduced `orphan_cap` slider for dynamic inference-time control |
 
 ## GCN Model Details
 Implementation: `gnn_drug_repurposing_improved.py`
@@ -253,9 +254,34 @@ Many diseases have few positive edges, making disease-specific ranking hard.
 Effect:
 - easier to overfit to broad global priors than fine disease signals
 
-## Backend and Frontend (Brief)
-- Backend: FastAPI serves `/predict`, `/metrics`, and plot endpoints; loads model once and precomputes embeddings.
-- Frontend: React/Vite app with discovery, performance, and bias tabs for interactive inspection.
+## Explainability and Biological Controls
+To transform the model from an experimental algorithm into a usable biological tool, we added:
+
+### 1. Subgraph Explainability (L2/L3 Path Search)
+Predictions can be inspected via the **"Explain"** action. The system performs a search in the PrimeKG knowledge graph to find biological pathways:
+- **Length-2 (L2):** Direct shared neighbors (e.g., `Drug -> Protein -> Disease`).
+- **Length-3 (L3):** Two-hop connections (e.g., `Drug -> Gene -> Phenotype -> Disease`).
+- These paths provide a biological hypothesis for *why* the GNN predicts a therapeutic relationship.
+
+### 2. Biological Filtering
+Users can apply filters to exclude specific pharmacological classes that may be irrelevant to their search:
+- **Exclude Immunosuppressants:** Removes drugs like Tacrolimus or Cyclosporine from candidates.
+- **Exclude Topical-only drugs:** Removes drugs intended only for skin/surface application.
+- Implementation uses a dictionary-based mapping (`DRUG_CATEGORIES`) in the backend to ensure precise filtering.
+
+### 3. Orphan Node Penalty Cap
+Highly connected "hub" nodes often dominate GNN predictions. While the model includes degree-normalization, some users may want more or less penalty. 
+- The **Orphan Node Penalty Cap** slider allows dynamic adjustment of the degree clamping threshold (`orphan_cap`) during inference. 
+- Higher values reduce the relative penalty for high-degree drugs, while lower values prioritize rarer "orphan" drugs.
+
+## Backend and Frontend Details
+- **Backend (FastAPI):**
+    - Serves `/predict`, `/explain`, `/metrics`, and `/plots-list`.
+    - Handles graph BFS for explainability and pre-computes drug-prior scores for de-bias reranking.
+- **Frontend (React/Vite/Framer Motion):**
+    - **Drug Discovery Tab:** Interactive search with biological filters, reranking sliders, and expanded "Explain" views for each candidate.
+    - **Model Performance Tab:** Displays real-time training metrics and diagnostic plots (ROC/PR curves, training loss).
+    - **Bias Analysis Tab:** Specialized dashboard for hub-bias diagnostics, including Spearman correlation and Jaccard diversity metrics.
 
 ## Reproduce
 ### Activate the env in the backend folder
@@ -264,11 +290,16 @@ linux
 source backend/venv/bin/activate
 ```
 ### Train
+### activate the venv before running this
+source backend/venv/bin/activate 
+
 ```bash
 python3 gnn_drug_repurposing_improved.py --device auto --epochs 200
 ```
 
 ### Backend
+### activate the venv before running this
+source backend/venv/bin/activate
 ```bash
 cd backend
 uvicorn main:app --host 0.0.0.0 --port 8000

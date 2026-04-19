@@ -56,8 +56,8 @@ class TrainConfig:
 
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    min_lr: float = 1e-5
-    lr_scheduler_factor: float = 0.5
+    min_lr: float = 1e-3
+    lr_scheduler_factor: float = 1.0
     lr_scheduler_patience: int = 5
     grad_clip_norm: float = 1.0
 
@@ -67,27 +67,27 @@ class TrainConfig:
     eval_unknown_fraction: float = 0.5
 
     # p(drug) ∝ degree ** power ; -0.5 gives inverse-sqrt weighting.
-    negative_drug_weight_power: float = -0.25
+    negative_drug_weight_power: float = -1.0
 
     batch_size: int = 2048
     patience: int = 15
-    degree_corr_lambda: float = 0.02
+    degree_corr_lambda: float = 0.15
 
     # Ranking + calibration loss configuration
-    # Final loss: bce_weight * BCE + bpr_weight * BPR + margin_rank_weight * MarginRank + degree reg
-    bce_weight: float = 1.0
-    bpr_weight: float = 0.8
-    margin_rank_weight: float = 0.35
+    # Final loss: bpr_weight * BPR + degree reg
+    bce_weight: float = 0.0
+    bpr_weight: float = 1.0
+    margin_rank_weight: float = 0.0
     margin_rank_margin: float = 0.5
 
     # BCE training negatives: source mix (normalized internally).
     train_neg_random_fraction: float = 0.5
     train_neg_contra_fraction: float = 0.3
-    train_neg_hard_fraction: float = 0.2
+    train_neg_hard_fraction: float = 0.4
 
     bpr_neg_per_pos: int = 5         # Negative drugs sampled per positive for BPR pairs
     hard_neg_fraction: float = 0.5   # Fraction of BPR negatives that are hard (model-scored)
-    hard_neg_start_epoch: int = 20   # Start hard negatives after this many epochs (warmup)
+    hard_neg_start_epoch: int = 0    # Start hard negatives after this many epochs (warmup)
     hard_neg_refresh: int = 10       # Re-mine hard negatives every N epochs
 
     ranking_k: int = 10
@@ -630,9 +630,10 @@ def build_train_base_edge_index(
     train_contra_drug = np.array([s for s, _ in train_contra_edges], dtype=np.int64)
     train_contra_disease = np.array([t for _, t in train_contra_edges], dtype=np.int64)
 
-    # Signed message-passing graph:
-    # +1 for non-drug-disease structure and TREATS edges
-    # -1 for CONTRAINDICATION edges
+    # RGCN relation types:
+    # Type 0: non-drug-disease background structure
+    # Type 1: TREATS / INDICATION
+    # Type 2: CONTRAINDICATION
     src_parts: List[np.ndarray] = [
         non_dd_src,
         non_dd_tgt,
@@ -649,22 +650,22 @@ def build_train_base_edge_index(
         train_contra_disease,
         train_contra_drug,
     ]
-    weight_parts: List[np.ndarray] = [
-        np.ones_like(non_dd_src, dtype=np.float32),
-        np.ones_like(non_dd_tgt, dtype=np.float32),
-        np.ones_like(train_treat_drug, dtype=np.float32),
-        np.ones_like(train_treat_disease, dtype=np.float32),
-        -np.ones_like(train_contra_drug, dtype=np.float32),
-        -np.ones_like(train_contra_disease, dtype=np.float32),
+    type_parts: List[np.ndarray] = [
+        np.zeros_like(non_dd_src, dtype=np.int64),
+        np.zeros_like(non_dd_tgt, dtype=np.int64),
+        np.ones_like(train_treat_drug, dtype=np.int64),
+        np.ones_like(train_treat_disease, dtype=np.int64),
+        np.full_like(train_contra_drug, 2, dtype=np.int64),
+        np.full_like(train_contra_disease, 2, dtype=np.int64),
     ]
 
     base_src = np.concatenate(src_parts)
     base_tgt = np.concatenate(tgt_parts)
-    base_weight = np.concatenate(weight_parts)
+    base_type = np.concatenate(type_parts)
 
     edge_index = torch.tensor(np.vstack([base_src, base_tgt]), dtype=torch.long, device=device)
-    edge_weight = torch.tensor(base_weight, dtype=torch.float, device=device)
-    return edge_index, edge_weight
+    edge_type = torch.tensor(base_type, dtype=torch.long, device=device)
+    return edge_index, edge_type
 
 
 def compute_degrees(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -877,57 +878,64 @@ def drop_edge(edge_index: torch.Tensor, drop_prob: float, training: bool) -> tor
     return edge_index[:, mask]
 
 
-def build_normalized_adjacency(
+def build_relational_adjacencies(
     edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
     num_nodes: int,
-    edge_weight: Optional[torch.Tensor] = None,
-    signed: bool = False,
-) -> torch.Tensor:
-    src, dst = edge_index
-    if edge_weight is None:
-        edge_weight = torch.ones(src.shape[0], device=edge_index.device)
-    else:
-        edge_weight = edge_weight.to(edge_index.device)
-    loop = torch.arange(num_nodes, device=edge_index.device)
-    loop_weight = torch.ones(num_nodes, device=edge_index.device)
-
-    src_all = torch.cat([src, loop])
-    dst_all = torch.cat([dst, loop])
-    values_all = torch.cat([edge_weight, loop_weight])
-
-    degree = torch.zeros(num_nodes, device=edge_index.device)
-    degree_values = values_all.abs() if signed else values_all
-    degree.scatter_add_(0, src_all, degree_values)
-
-    deg_inv_sqrt = degree.clamp(min=1).pow(-0.5)
-    norm_values = deg_inv_sqrt[src_all] * values_all * deg_inv_sqrt[dst_all]
-
-    return torch.sparse_coo_tensor(
-        torch.stack([src_all, dst_all]),
-        norm_values,
-        size=(num_nodes, num_nodes),
-    ).coalesce()
+    num_relations: int = 3,
+) -> List[torch.Tensor]:
+    adjs = []
+    
+    for r in range(num_relations):
+        mask = (edge_type == r)
+        src = edge_index[0, mask]
+        dst = edge_index[1, mask]
+        
+        # Calculate degrees for this specific relation
+        degree = torch.zeros(num_nodes, device=edge_index.device)
+        ones = torch.ones_like(src, dtype=torch.float)
+        degree.scatter_add_(0, src, ones)
+        
+        deg_inv_sqrt = degree.clamp(min=1).pow(-0.5)
+        norm_values = deg_inv_sqrt[src] * ones * deg_inv_sqrt[dst]
+        
+        adj = torch.sparse_coo_tensor(
+            torch.stack([src, dst]),
+            norm_values,
+            size=(num_nodes, num_nodes),
+        ).coalesce()
+        adjs.append(adj)
+        
+    return adjs
 
 
-class GraphConv(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
+class RGCNConv(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, num_relations: int = 3):
         super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim)
+        self.num_relations = num_relations
+        self.weight = nn.Parameter(torch.Tensor(num_relations, in_dim, out_dim))
+        self.loop_weight = nn.Parameter(torch.Tensor(in_dim, out_dim))
+        
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.xavier_uniform_(self.loop_weight)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        x = torch.sparse.mm(adj, x)
-        return self.linear(x)
+    def forward(self, x: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
+        out = torch.matmul(x, self.loop_weight)
+        for r in range(self.num_relations):
+            msg = torch.sparse.mm(adjs[r], x)
+            out = out + torch.matmul(msg, self.weight[r])
+        return out
 
 
-class ResidualGCNLayer(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.0):
+class ResidualRGCNLayer(nn.Module):
+    def __init__(self, dim: int, num_relations: int = 3, dropout: float = 0.0):
         super().__init__()
-        self.conv = GraphConv(dim, dim)
+        self.conv = RGCNConv(dim, dim, num_relations)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x, adj)
+    def forward(self, x: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
+        h = self.conv(x, adjs)
         h = self.norm(h)
         h = F.relu(h)
         h = self.dropout(h)
@@ -940,29 +948,33 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
         self.type_embedding = nn.Embedding(num_types, hidden_dim)
 
-        # 3 hidden GCN stages with residual processing.
-        self.gcn_in = GraphConv(hidden_dim, hidden_dim)
-        self.res_layers = nn.ModuleList([ResidualGCNLayer(hidden_dim, dropout) for _ in range(2)])
-        self.gcn_out = GraphConv(hidden_dim, embedding_dim)
+        # 2 hidden RGCN stages with residual processing to reduce oversmoothing.
+        self.gcn_in = RGCNConv(hidden_dim, hidden_dim, num_relations=3)
+        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(1)])
+        self.gcn_out = RGCNConv(hidden_dim, embedding_dim, num_relations=3)
 
-        # src, dst, elementwise product, and log-degree features.
+        # src, dst, and elementwise product features (no degree features to avoid bias).
         self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 3 + 2, embedding_dim),
+            nn.Linear(embedding_dim * 3, embedding_dim),
             nn.ReLU(),
             nn.BatchNorm1d(embedding_dim),
             nn.Dropout(dropout),
             nn.Linear(embedding_dim, 1),
         )
+        
+        # Explicit learnable degree penalty scalars
+        self.degree_alpha = nn.Parameter(torch.tensor(0.1))
+        self.degree_beta = nn.Parameter(torch.tensor(0.1))
 
-    def encode(self, node_type_ids: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+    def encode(self, node_type_ids: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
         idx = torch.arange(len(node_type_ids), device=node_type_ids.device)
         x = self.node_embedding(idx) + self.type_embedding(node_type_ids)
 
-        x = F.relu(self.gcn_in(x, adj))
+        x = F.relu(self.gcn_in(x, adjs))
         for layer in self.res_layers:
-            x = layer(x, adj)
+            x = layer(x, adjs)
 
-        return self.gcn_out(x, adj)
+        return self.gcn_out(x, adjs)
 
     def score(self, z: torch.Tensor, pairs: torch.Tensor, degrees: torch.Tensor) -> torch.Tensor:
         src_idx = pairs[0]
@@ -971,11 +983,17 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         src_z = z[src_idx]
         dst_z = z[dst_idx]
 
-        src_deg = torch.log(degrees[src_idx].clamp(min=1).float()).unsqueeze(1)
-        dst_deg = torch.log(degrees[dst_idx].clamp(min=1).float()).unsqueeze(1)
+        src_deg = degrees[src_idx].clamp(min=1).float()
+        dst_deg = degrees[dst_idx].clamp(min=1).float()
 
-        features = torch.cat([src_z, dst_z, src_z * dst_z, src_deg, dst_deg], dim=-1)
-        return self.link_predictor(features).squeeze(-1)
+        features = torch.cat([src_z, dst_z, src_z * dst_z], dim=-1)
+        mlp_score = self.link_predictor(features).squeeze(-1)
+        
+        # Explicit residual de-biasing to cancel hub advantage, plus normalize the MLP score
+        base_score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
+        normalized_score = base_score / (torch.sqrt(src_deg) * torch.sqrt(dst_deg) + 1e-8)
+        
+        return normalized_score
 
 
 def predict_logits(
@@ -1740,7 +1758,7 @@ def main() -> None:
 
     # Signed message-passing graph:
     # +1 for TREATS, -1 for CONTRAINDICATION, +1 for non-drug-disease structure.
-    base_edge_index, base_edge_weight = build_train_base_edge_index(
+    base_edge_index, base_edge_type = build_train_base_edge_index(
         src_idx=node_artifacts.src_idx,
         tgt_idx=node_artifacts.tgt_idx,
         is_drug_disease=is_drug_disease,
@@ -1753,14 +1771,14 @@ def main() -> None:
     node_artifacts.tgt_idx = None
     node_artifacts.relations = None
 
-    static_adj = build_normalized_adjacency(
+    static_adj = build_relational_adjacencies(
         base_edge_index,
+        base_edge_type,
         num_nodes,
-        edge_weight=base_edge_weight,
-        signed=True,
-    ).to(device)
+        num_relations=3,
+    )
     degree_tensor = compute_degrees(base_edge_index, num_nodes)
-    del base_edge_index, base_edge_weight  # No longer needed after adjacency is built
+    del base_edge_index, base_edge_type  # No longer needed after adjacency is built
     gc.collect()
     print(f"Graph: {num_nodes:,} nodes | Memory freed after adjacency build")
 
@@ -1774,8 +1792,9 @@ def main() -> None:
 
     # Block all known therapeutic positives (across splits) so hard negatives
     # can never include a known treatment edge.
-    blocked_pairs: Set[Tuple[int, int]] = set(positive_edges)
-    blocked_known_pairs = set(positive_edges).union(set(contraindication_edges))
+    # Do NOT add contraindication_edges to blocked_known_pairs, otherwise the negative sampler 
+    # will completely skip them when trying to sample from the contra pool!
+    blocked_known_pairs = set(positive_edges)
     therapeutic_drug_nodes_np = therapeutic_drug_nodes.detach().cpu().numpy()
 
     train_neg_target_total = int(len(train_pos) * config.negative_ratio)
@@ -1902,13 +1921,8 @@ def main() -> None:
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=config.lr_scheduler_factor,
-        patience=config.lr_scheduler_patience,
-        min_lr=config.min_lr,
-    )
+    patience_counter = 0
+    best_val_mrr = -1.0
 
     node_type_ids = node_artifacts.node_type_ids.to(device)
     drug_nodes_device = node_artifacts.drug_nodes.to(device)
@@ -1943,7 +1957,7 @@ def main() -> None:
                 drug_nodes=therapeutic_drug_nodes_device,
                 disease_nodes=disease_nodes_device,
                 degrees=degree_tensor,
-                blocked_pairs=blocked_pairs,
+                blocked_pairs=blocked_known_pairs,
                 neg_per_pos=config.bpr_neg_per_pos,
                 batch_size=config.batch_size,
                 rng=rng,
@@ -2055,7 +2069,6 @@ def main() -> None:
             )
 
         val_mrr = float(val_ranking["mrr"])
-        scheduler.step(val_mrr)
 
         current_lr = optimizer.param_groups[0]["lr"]
         history["epoch"].append(float(epoch))
@@ -2109,7 +2122,7 @@ def main() -> None:
                 },
             }
             torch.save(checkpoint, config.models_dir / "gnn_drug_repurposing.pt")
-            torch.save(static_adj.cpu(), config.models_dir / "adjacency.pt")
+            torch.save([adj.cpu() for adj in static_adj], config.models_dir / "adjacency.pt")
             torch.save(degree_tensor.cpu(), config.models_dir / "degrees.pt")
         else:
             patience_counter += 1

@@ -19,28 +19,38 @@ load_dotenv()
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 # Graph Neural Network Classes (must match training script architecture)
-class GraphConv(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
+class RGCNConv(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, num_relations: int = 3):
         super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim)
+        self.num_relations = num_relations
+        self.weight = nn.Parameter(torch.Tensor(num_relations, in_dim, out_dim))
+        self.loop_weight = nn.Parameter(torch.Tensor(in_dim, out_dim))
+        
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.xavier_uniform_(self.loop_weight)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        x_sparse = torch.sparse.mm(adj, x)
-        return self.linear(x_sparse)
+    def forward(self, x: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
+        out = torch.matmul(x, self.loop_weight)
+        for r in range(self.num_relations):
+            msg = torch.sparse.mm(adjs[r], x)
+            out = out + torch.matmul(msg, self.weight[r])
+        return out
 
-class ResidualGCNLayer(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.0):
+
+class ResidualRGCNLayer(nn.Module):
+    def __init__(self, dim: int, num_relations: int = 3, dropout: float = 0.0):
         super().__init__()
-        self.conv = GraphConv(dim, dim)
+        self.conv = RGCNConv(dim, dim, num_relations)
         self.norm = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        h = self.conv(x, adj)
+    def forward(self, x: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
+        h = self.conv(x, adjs)
         h = self.norm(h)
         h = F.relu(h)
         h = self.dropout(h)
         return x + h
+
 
 class PrimeKGDrugRepurposingGNN(nn.Module):
     def __init__(self, num_nodes: int, num_types: int, hidden_dim: int, embedding_dim: int, dropout: float):
@@ -48,31 +58,30 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
         self.type_embedding = nn.Embedding(num_types, hidden_dim)
 
-        self.gcn_in = GraphConv(hidden_dim, hidden_dim)
-        self.res_layers = nn.ModuleList([
-            ResidualGCNLayer(hidden_dim, dropout) for _ in range(2)
-        ])
-
-        self.gcn_out = GraphConv(hidden_dim, embedding_dim)
+        self.gcn_in = RGCNConv(hidden_dim, hidden_dim, num_relations=3)
+        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(1)])
+        self.gcn_out = RGCNConv(hidden_dim, embedding_dim, num_relations=3)
 
         self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 3 + 2, embedding_dim),
+            nn.Linear(embedding_dim * 3, embedding_dim),
             nn.ReLU(),
             nn.BatchNorm1d(embedding_dim),
             nn.Dropout(dropout),
-            nn.Linear(embedding_dim, 1)
+            nn.Linear(embedding_dim, 1),
         )
+        
+        self.degree_alpha = nn.Parameter(torch.tensor(0.1))
+        self.degree_beta = nn.Parameter(torch.tensor(0.1))
 
-    def encode(self, node_type_ids: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+    def encode(self, node_type_ids: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
         idx = torch.arange(len(node_type_ids), device=node_type_ids.device)
         x = self.node_embedding(idx) + self.type_embedding(node_type_ids)
 
-        x = F.relu(self.gcn_in(x, adj))
+        x = F.relu(self.gcn_in(x, adjs))
         for layer in self.res_layers:
-            x = layer(x, adj)
+            x = layer(x, adjs)
 
-        x = self.gcn_out(x, adj)
-        return x
+        return self.gcn_out(x, adjs)
 
     def score(self, z: torch.Tensor, pairs: torch.Tensor, degrees: torch.Tensor) -> torch.Tensor:
         src_idx = pairs[0]
@@ -81,11 +90,16 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         src_z = z[src_idx]
         dst_z = z[dst_idx]
 
-        src_deg = torch.log(degrees[src_idx].clamp(min=1).float()).unsqueeze(1)
-        dst_deg = torch.log(degrees[dst_idx].clamp(min=1).float()).unsqueeze(1)
+        src_deg = degrees[src_idx].clamp(min=1).float()
+        dst_deg = degrees[dst_idx].clamp(min=1).float()
 
-        feat = torch.cat([src_z, dst_z, src_z * dst_z, src_deg, dst_deg], dim=-1)
-        return self.link_predictor(feat).squeeze(-1)
+        features = torch.cat([src_z, dst_z, src_z * dst_z], dim=-1)
+        mlp_score = self.link_predictor(features).squeeze(-1)
+        
+        base_score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
+        normalized_score = base_score / (torch.sqrt(src_deg) * torch.sqrt(dst_deg) + 1e-8)
+        
+        return normalized_score
 
 
 # ─── App Setup ────────────────────────────────────────────────────────
@@ -126,6 +140,12 @@ contraindications_by_disease = {}
 therapeutic_by_disease = {}
 drug_prior_centered = {}
 prior_sampled_diseases = 0
+adj_list_1hop = {}  # For explainability
+
+DRUG_CATEGORIES = {
+    "immunosuppressants": {"tacrolimus", "cyclosporine", "mycophenolate", "sirolimus", "azathioprine", "methotrexate", "dexamethasone", "prednisone"},
+    "topical": {"alitretinoin", "clobetasol", "fluocinonide", "fluorouracil", "hydrocortisone", "betamethasone"}
+}
 
 
 class PredictionRequest(BaseModel):
@@ -143,6 +163,8 @@ class PredictionRequest(BaseModel):
     hub_penalty_factor: float = 0.7
     use_disease_zscore: bool = True
     candidate_limit: int = 6
+    exclude_categories: List[str] = []
+    orphan_cap: float = 5.0
 
 
 def normalize_text(text: str) -> str:
@@ -315,7 +337,7 @@ def load_models():
     global metadata, model, adj, degrees, z, training_metrics, degree_thresholds
     global therapeutic_drug_nodes, disease_catalog, disease_catalog_by_idx
     global contraindications_by_disease, therapeutic_by_disease
-    global drug_prior_centered, prior_sampled_diseases
+    global drug_prior_centered, prior_sampled_diseases, adj_list_1hop
     try:
         # Load metadata
         with open(models_dir / 'metadata.pkl', 'rb') as f:
@@ -402,16 +424,32 @@ def load_models():
         # Global drug prior used for de-bias reranking at inference time.
         prior_drug_nodes = [int(x) for x in (therapeutic_drug_nodes or metadata['drug_nodes'])]
         prior_disease_nodes = [int(x) for x in metadata['disease_nodes']]
-        drug_prior_centered, prior_sampled_diseases = compute_drug_prior_centered_scores(
-            drug_nodes=prior_drug_nodes,
-            disease_nodes=prior_disease_nodes,
-            sample_size=128,
-        )
+        
+        # Adjusting the prior computation to use the list of adjs
+        if model is not None and z is not None:
+            drug_prior_centered, prior_sampled_diseases = compute_drug_prior_centered_scores(
+                drug_nodes=prior_drug_nodes,
+                disease_nodes=prior_disease_nodes,
+                sample_size=128,
+            )
+
+        # Build 1-hop adjacency list for explainability
+        if adj is not None:
+            adj_list_1hop.clear()
+            for r in range(len(adj)):
+                indices = adj[r]._indices().cpu().numpy()
+                for i in range(indices.shape[1]):
+                    u, v = int(indices[0, i]), int(indices[1, i])
+                    if u not in adj_list_1hop: adj_list_1hop[u] = set()
+                    if v not in adj_list_1hop: adj_list_1hop[v] = set()
+                    adj_list_1hop[u].add(v)
+                    adj_list_1hop[v].add(u)
 
         print(f"Models loaded successfully. Config: hidden={config['hidden_dim']}, embed={config['embedding_dim']}")
         print(f"Drug degree thresholds: q33={q33:.0f}, q66={q66:.0f}")
         print(f"Disease catalog size: {len(disease_catalog)}")
         print(f"Drug prior map size: {len(drug_prior_centered)} (sampled diseases={prior_sampled_diseases})")
+        print(f"Graph loaded for explainability: {len(adj_list_1hop)} nodes")
     except Exception as e:
         print(f"Error loading models: {e}")
         import traceback
@@ -419,6 +457,74 @@ def load_models():
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────
+
+class ExplainRequest(BaseModel):
+    drug_node_idx: int
+    disease_node_idx: int
+
+@app.post("/explain")
+def explain_path(req: ExplainRequest):
+    if not adj_list_1hop:
+        raise HTTPException(status_code=500, detail="Graph not loaded")
+    
+    drug_idx = req.drug_node_idx
+    disease_idx = req.disease_node_idx
+    
+    if drug_idx not in adj_list_1hop or disease_idx not in adj_list_1hop:
+        return {"paths": []}
+        
+    drug_neighbors = adj_list_1hop[drug_idx]
+    disease_neighbors = adj_list_1hop[disease_idx]
+    
+    shared_nodes = drug_neighbors.intersection(disease_neighbors)
+    
+    paths = []
+    all_keys = metadata['all_keys']
+    
+    def format_node(idx):
+        key = all_keys[idx]
+        parts = key.split("::")
+        node_type = parts[0]
+        node_id = parts[1]
+        
+        if node_type == 'gene/protein':
+            name = f"Protein {node_id}"
+        elif node_type == 'phenotype':
+            name = f"Phenotype {node_id}"
+        else:
+            name = f"{node_type.capitalize()} {node_id}"
+        return {"idx": idx, "type": node_type, "name": name}
+
+    # Length-2 paths
+    for node_idx in shared_nodes:
+        node_info = format_node(node_idx)
+        paths.append({
+            "path_len": 2,
+            "nodes": [format_node(drug_idx), node_info, format_node(disease_idx)],
+            "shared_node_idx": node_idx,
+            "shared_node_type": node_info["type"],
+            "shared_node_name": node_info["name"]
+        })
+        if len(paths) >= 20: break
+
+    # Fallback to Length-3 paths if no length-2 paths exist
+    if not paths:
+        for n1 in drug_neighbors:
+            if n1 == disease_idx: continue
+            for n2 in adj_list_1hop.get(n1, set()):
+                if n2 == drug_idx or n2 == disease_idx: continue
+                if n2 in disease_neighbors:
+                    paths.append({
+                        "path_len": 3,
+                        "nodes": [format_node(drug_idx), format_node(n1), format_node(n2), format_node(disease_idx)],
+                        "shared_node_idx": n1,
+                        "shared_node_type": "complex_path",
+                        "shared_node_name": f"{format_node(n1)['name']} ➔ {format_node(n2)['name']}"
+                    })
+                    if len(paths) >= 10: break
+            if len(paths) >= 10: break
+
+    return {"paths": paths}
 
 @app.get("/health")
 def health():
@@ -482,6 +588,23 @@ def predict(req: PredictionRequest):
     if req.exclude_known_treatments:
         filtered_out.update(known_treatment_drugs)
 
+    drug_id_to_name = metadata['drug_id_to_name']
+    all_keys = metadata['all_keys']
+
+    # Biological Filtering
+    if req.exclude_categories:
+        cat_drugs = set()
+        for cat in req.exclude_categories:
+            if cat in DRUG_CATEGORIES:
+                cat_drugs.update(DRUG_CATEGORIES[cat])
+        
+        filtered_out_by_cat = set()
+        for d in base_candidate_drug_nodes:
+            d_name = normalize_text(drug_id_to_name.get(all_keys[d].split("::")[1], ""))
+            if any(c in d_name for c in cat_drugs):
+                filtered_out_by_cat.add(d)
+        filtered_out.update(filtered_out_by_cat)
+
     candidate_drug_nodes = [
         int(d) for d in base_candidate_drug_nodes
         if int(d) not in filtered_out
@@ -492,15 +615,14 @@ def predict(req: PredictionRequest):
             detail="No candidate drugs left after contraindication/treatment filtering."
         )
 
-    drug_id_to_name = metadata['drug_id_to_name']
-    all_keys = metadata['all_keys']
-
     pairs = torch.tensor([[d, target_disease_idx] for d in candidate_drug_nodes], dtype=torch.long).T.to(device)
 
     hub_threshold_value: Optional[float] = None
     with torch.no_grad():
-        raw_scores_t = torch.sigmoid(model.score(z, pairs, degrees))
-        rank_scores_t = raw_scores_t.clone()
+        # model.score now returns normalized scores (logits)
+        logits_t = model.score(z, pairs, degrees)
+        raw_scores_t = torch.sigmoid(logits_t)
+        rank_scores_t = logits_t.clone() # Rerank based on logits for more dynamic range
         drug_degree_t = degrees[pairs[0]].float().clamp(min=1.0)
 
         use_disease_zscore = bool(req.use_disease_zscore)
@@ -511,7 +633,9 @@ def predict(req: PredictionRequest):
 
         use_specificity = bool(req.use_specificity_rerank)
         specificity_beta = float(max(0.0, min(req.specificity_beta, 3.0)))
-        specificity_t = 1.0 / torch.log1p(drug_degree_t)
+        orphan_cap_val = float(max(1.0, req.orphan_cap))
+        drug_degree_capped = torch.clamp(drug_degree_t, min=orphan_cap_val)
+        specificity_t = 1.0 / torch.log1p(drug_degree_capped)
         specificity_t = specificity_t / specificity_t.mean().clamp(min=1e-6)
         if use_specificity:
             rank_scores_t = rank_scores_t * specificity_t.pow(specificity_beta)
@@ -529,7 +653,7 @@ def predict(req: PredictionRequest):
         alpha = float(max(0.0, min(req.debias_alpha, 1.5)))
         use_debias = bool(req.use_debias_rerank) and len(drug_prior_centered) > 0
         prior_vals = [float(drug_prior_centered.get(int(d), 0.0)) for d in candidate_drug_nodes]
-        prior_t = torch.tensor(prior_vals, dtype=raw_scores_t.dtype, device=raw_scores_t.device)
+        prior_t = torch.tensor(prior_vals, dtype=rank_scores_t.dtype, device=rank_scores_t.device)
         if use_debias:
             prior_norm_t = prior_t
             if use_disease_zscore:
@@ -603,6 +727,7 @@ def predict(req: PredictionRequest):
         ligand_url = f"{BASE_URL}/data/ligands/{safe_drug_name}.sdf" if os.path.exists(ligand_path) else None
 
         results.append({
+            "drug_node_idx": drug_idx,
             "drug_name": drug_name,
             "gnn_score": round(gnn_score, 4),
             "rank_score": round(rank_score, 4),
@@ -628,12 +753,14 @@ def predict(req: PredictionRequest):
         "filter_settings": {
             "exclude_contraindicated": req.exclude_contraindicated,
             "exclude_known_treatments": req.exclude_known_treatments,
+            "exclude_categories": req.exclude_categories,
         },
         "rerank_settings": {
             "use_debias_rerank": bool(req.use_debias_rerank),
             "debias_alpha": round(float(max(0.0, min(req.debias_alpha, 1.5))), 4),
             "use_specificity_rerank": bool(req.use_specificity_rerank),
             "specificity_beta": round(float(max(0.0, min(req.specificity_beta, 3.0))), 4),
+            "orphan_cap": round(float(max(1.0, req.orphan_cap)), 4),
             "use_hub_penalty": bool(req.use_hub_penalty),
             "hub_degree_quantile": round(float(max(0.5, min(req.hub_degree_quantile, 0.99))), 4),
             "hub_penalty_factor": round(float(max(0.1, min(req.hub_penalty_factor, 1.0))), 4),

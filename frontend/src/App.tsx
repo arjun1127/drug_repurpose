@@ -22,6 +22,7 @@ interface TargetProtein {
 }
 
 interface Prediction {
+  drug_node_idx: number;
   drug_name: string;
   gnn_score: number;
   rank_score?: number;
@@ -53,10 +54,19 @@ interface ResultsResponse {
   filter_settings?: {
     exclude_contraindicated: boolean;
     exclude_known_treatments: boolean;
+    exclude_categories: string[];
   };
   rerank_settings?: {
     use_debias_rerank: boolean;
     debias_alpha: number;
+    use_specificity_rerank: boolean;
+    specificity_beta: number;
+    orphan_cap: number;
+    use_hub_penalty: boolean;
+    hub_degree_quantile: number;
+    hub_penalty_factor: number;
+    hub_degree_threshold: number | null;
+    use_disease_zscore: boolean;
     prior_sampled_diseases: number;
   };
 }
@@ -129,6 +139,15 @@ function App() {
   const [openViewers, setOpenViewers] = useState<Record<string, boolean>>({});
   const [activeTarget, setActiveTarget] = useState<TargetProtein | null>(null);
 
+  // Filters & Settings
+  const [excludeImmunosuppressants, setExcludeImmunosuppressants] = useState(false);
+  const [excludeTopical, setExcludeTopical] = useState(false);
+  const [orphanCap, setOrphanCap] = useState(5.0);
+
+  // Explainability
+  const [explanations, setExplanations] = useState<Record<string, any[]>>({});
+  const [loadingExplanations, setLoadingExplanations] = useState<Record<string, boolean>>({});
+
   // Metrics & plots
   const [metrics, setMetrics] = useState<TrainingMetrics | null>(null);
   const [plotFiles, setPlotFiles] = useState<string[]>([]);
@@ -162,7 +181,12 @@ function App() {
     setLoading(true);
     setError('');
     setOpenViewers({});
+    setExplanations({});
     setActiveTarget(null);
+
+    const categories: string[] = [];
+    if (excludeImmunosuppressants) categories.push('immunosuppressants');
+    if (excludeTopical) categories.push('topical');
 
     try {
       const response = await axios.post(`${API_URL}/predict`, {
@@ -174,6 +198,8 @@ function App() {
         use_debias_rerank: true,
         debias_alpha: 0.35,
         candidate_limit: 8,
+        exclude_categories: categories,
+        orphan_cap: orphanCap
       });
       setResults(response.data);
       if (response.data.targets?.length > 0) {
@@ -195,6 +221,31 @@ function App() {
 
     setResults(null);
     await runPrediction(query.trim());
+  };
+
+  const fetchExplanation = async (drugNodeIdx: number, drugName: string) => {
+    if (explanations[drugName]) {
+      const newExps = { ...explanations };
+      delete newExps[drugName];
+      setExplanations(newExps);
+      return;
+    }
+    
+    const diseaseIdx = results?.selected_disease_node_idx ?? results?.disease_candidates?.[0]?.disease_node_idx;
+    if (diseaseIdx === undefined) return;
+    
+    setLoadingExplanations(prev => ({ ...prev, [drugName]: true }));
+    try {
+      const res = await axios.post(`${API_URL}/explain`, {
+        drug_node_idx: drugNodeIdx,
+        disease_node_idx: diseaseIdx
+      });
+      setExplanations(prev => ({ ...prev, [drugName]: res.data.paths || [] }));
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingExplanations(prev => ({ ...prev, [drugName]: false }));
+    }
   };
 
   const getScoreColor = (score: number) => {
@@ -277,6 +328,34 @@ function App() {
                   {loading ? 'Analyzing...' : 'Discover'}
                 </button>
               </form>
+            </div>
+
+            <div style={{ display: 'flex', gap: '2rem', marginBottom: '2rem', padding: '1.5rem', background: 'rgba(30,41,59,0.3)', borderRadius: '12px', flexWrap: 'wrap', border: '1px solid rgba(255,255,255,0.05)' }}>
+              <div style={{ flex: 1, minWidth: '250px' }}>
+                <h4 style={{ marginBottom: '1rem', color: '#e2e8f0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <ShieldAlert size={16} /> Biological Filters
+                </h4>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', marginBottom: '0.5rem', color: '#cbd5e1', fontSize: '0.9rem' }}>
+                  <input type="checkbox" checked={excludeImmunosuppressants} onChange={e => setExcludeImmunosuppressants(e.target.checked)} />
+                  Exclude Immunosuppressants
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', color: '#cbd5e1', fontSize: '0.9rem' }}>
+                  <input type="checkbox" checked={excludeTopical} onChange={e => setExcludeTopical(e.target.checked)} />
+                  Exclude Topical-only drugs
+                </label>
+              </div>
+              <div style={{ flex: 1, minWidth: '250px' }}>
+                <h4 style={{ marginBottom: '1rem', color: '#e2e8f0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <TrendingUp size={16} /> Orphan Node Penalty Cap
+                </h4>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', color: '#cbd5e1' }}>
+                  <input type="range" min="1" max="20" step="1" value={orphanCap} onChange={e => setOrphanCap(parseFloat(e.target.value))} style={{ flex: 1, cursor: 'pointer' }} />
+                  <span style={{ minWidth: '30px', fontWeight: 'bold' }}>{orphanCap}</span>
+                </div>
+                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+                  Balances penalty for highly connected drugs vs. orphans. Lower = more penalty for hubs.
+                </p>
+              </div>
             </div>
 
             {loading && (
@@ -438,36 +517,92 @@ function App() {
                           </div>
                         </div>
 
-                        {/* 3D Structure Viewer Toggle */}
-                        {pred.ligand_url && (
-                          <div style={{ marginTop: '0.5rem', paddingTop: '0.8rem', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                        {/* Actions Toggle */}
+                        <div style={{ marginTop: '0.5rem', paddingTop: '0.8rem', borderTop: '1px solid rgba(255,255,255,0.05)', display: 'flex', gap: '0.5rem' }}>
+                          <button
+                            onClick={() => fetchExplanation(pred.drug_node_idx, pred.drug_name)}
+                            style={{
+                              flex: 1, padding: '0.5rem',
+                              background: 'rgba(16, 185, 129, 0.1)', color: '#34d399',
+                              border: '1px solid rgba(16, 185, 129, 0.2)', borderRadius: '6px',
+                              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              gap: '0.4rem', transition: 'all 0.2s', fontSize: '0.85rem'
+                            }}
+                          >
+                            {loadingExplanations[pred.drug_name] ? <Loader2 size={14} className="animate-spin" /> : <Layers size={14} />}
+                            {explanations[pred.drug_name] ? 'Hide Path' : 'Explain'}
+                          </button>
+                          
+                          {pred.ligand_url && (
                             <button
                               onClick={() => toggleViewer(pred.drug_name)}
                               style={{
-                                width: '100%', padding: '0.5rem',
+                                flex: 1, padding: '0.5rem',
                                 background: 'rgba(59, 130, 246, 0.1)', color: '#60a5fa',
                                 border: '1px solid rgba(59, 130, 246, 0.2)', borderRadius: '6px',
                                 cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                gap: '0.5rem', transition: 'all 0.2s', fontSize: '0.9rem'
+                                gap: '0.4rem', transition: 'all 0.2s', fontSize: '0.85rem'
                               }}
                             >
-                              <FileEdit size={16} />
-                              {openViewers[pred.drug_name] ? 'Hide 3D Structure' : 'View 3D Structure'}
+                              <FileEdit size={14} />
+                              {openViewers[pred.drug_name] ? 'Hide 3D' : 'View 3D'}
                             </button>
-                            <AnimatePresence>
-                              {openViewers[pred.drug_name] && (
-                                <motion.div
-                                  initial={{ height: 0, opacity: 0 }}
-                                  animate={{ height: 'auto', opacity: 1 }}
-                                  exit={{ height: 0, opacity: 0 }}
-                                  style={{ overflow: 'hidden', marginTop: '1rem' }}
-                                >
-                                  <MolecularViewer url={pred.ligand_url} format="sdf" title={pred.drug_name} />
-                                </motion.div>
+                          )}
+                        </div>
+
+                        <AnimatePresence>
+                          {/* Explain paths block */}
+                          {explanations[pred.drug_name] && (
+                            <motion.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              style={{ overflow: 'hidden', marginTop: '1rem', padding: '0.75rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}
+                            >
+                              <h5 style={{ color: '#e2e8f0', fontSize: '0.85rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                                <CheckCircle size={14} color="#34d399" /> Subgraph Paths
+                              </h5>
+                              {explanations[pred.drug_name].length === 0 ? (
+                                <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No direct paths found (requires deeper search).</div>
+                              ) : (
+                                  <ul style={{ margin: 0, paddingLeft: '0.5rem', fontSize: '0.8rem', color: '#cbd5e1', listStyle: 'none' }}>
+                                    {explanations[pred.drug_name].map((pathObj, pidx) => (
+                                      <li key={pidx} style={{ marginBottom: '0.6rem', display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                                        <span style={{ 
+                                          fontSize: '0.65rem', 
+                                          background: pathObj.path_len === 2 ? 'rgba(52, 211, 153, 0.2)' : 'rgba(251, 191, 36, 0.2)', 
+                                          color: pathObj.path_len === 2 ? '#34d399' : '#fbbf24',
+                                          padding: '1px 4px',
+                                          borderRadius: '4px',
+                                          marginTop: '2px',
+                                          fontWeight: 'bold'
+                                        }}>
+                                          L{pathObj.path_len}
+                                        </span>
+                                        <div>
+                                          <span style={{ color: '#60a5fa' }}>{pred.drug_name}</span> ➔{' '}
+                                          <span style={{ color: '#a78bfa' }}>[{pathObj.shared_node_type}]</span> {pathObj.shared_node_name} ➔{' '}
+                                          <span style={{ color: '#f472b6' }}>{results?.disease}</span>
+                                        </div>
+                                      </li>
+                                    ))}
+                                  </ul>
                               )}
-                            </AnimatePresence>
-                          </div>
-                        )}
+                            </motion.div>
+                          )}
+
+                          {/* 3D Structure block */}
+                          {openViewers[pred.drug_name] && pred.ligand_url && (
+                            <motion.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              style={{ overflow: 'hidden', marginTop: '1rem' }}
+                            >
+                              <MolecularViewer url={pred.ligand_url} format="sdf" title={pred.drug_name} />
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
                       </div>
                     </motion.div>
                   ))}
