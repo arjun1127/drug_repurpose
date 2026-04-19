@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import pickle
 import json
 from pathlib import Path
@@ -134,7 +135,13 @@ class PredictionRequest(BaseModel):
     exclude_contraindicated: bool = True
     exclude_known_treatments: bool = True
     use_debias_rerank: bool = True
-    debias_alpha: float = 0.35
+    debias_alpha: float = 0.8
+    use_specificity_rerank: bool = True
+    specificity_beta: float = 1.0
+    use_hub_penalty: bool = True
+    hub_degree_quantile: float = 0.9
+    hub_penalty_factor: float = 0.7
+    use_disease_zscore: bool = True
     candidate_limit: int = 6
 
 
@@ -490,20 +497,53 @@ def predict(req: PredictionRequest):
 
     pairs = torch.tensor([[d, target_disease_idx] for d in candidate_drug_nodes], dtype=torch.long).T.to(device)
 
+    hub_threshold_value: Optional[float] = None
     with torch.no_grad():
         raw_scores_t = torch.sigmoid(model.score(z, pairs, degrees))
-        rank_scores_t = raw_scores_t
+        rank_scores_t = raw_scores_t.clone()
+        drug_degree_t = degrees[pairs[0]].float().clamp(min=1.0)
 
+        use_disease_zscore = bool(req.use_disease_zscore)
+        if use_disease_zscore:
+            score_mean = rank_scores_t.mean()
+            score_std = rank_scores_t.std(unbiased=False).clamp(min=1e-6)
+            rank_scores_t = (rank_scores_t - score_mean) / score_std
+
+        use_specificity = bool(req.use_specificity_rerank)
+        specificity_beta = float(max(0.0, min(req.specificity_beta, 3.0)))
+        specificity_t = 1.0 / torch.log1p(drug_degree_t)
+        specificity_t = specificity_t / specificity_t.mean().clamp(min=1e-6)
+        if use_specificity:
+            rank_scores_t = rank_scores_t * specificity_t.pow(specificity_beta)
+
+        use_hub_penalty = bool(req.use_hub_penalty)
+        hub_degree_quantile = float(max(0.5, min(req.hub_degree_quantile, 0.99)))
+        hub_penalty_factor = float(max(0.1, min(req.hub_penalty_factor, 1.0)))
+        if use_hub_penalty:
+            degree_np = drug_degree_t.detach().cpu().numpy()
+            hub_threshold_value = float(np.quantile(degree_np, hub_degree_quantile))
+            hub_mask = drug_degree_t > hub_threshold_value
+            rank_scores_t = torch.where(hub_mask, rank_scores_t * hub_penalty_factor, rank_scores_t)
+
+        # Debias by subtracting global drug prior.
         alpha = float(max(0.0, min(req.debias_alpha, 1.5)))
         use_debias = bool(req.use_debias_rerank) and len(drug_prior_centered) > 0
         prior_vals = [float(drug_prior_centered.get(int(d), 0.0)) for d in candidate_drug_nodes]
         prior_t = torch.tensor(prior_vals, dtype=raw_scores_t.dtype, device=raw_scores_t.device)
         if use_debias:
-            rank_scores_t = raw_scores_t - alpha * prior_t
+            prior_norm_t = prior_t
+            if use_disease_zscore:
+                prior_mean = prior_norm_t.mean()
+                prior_std = prior_norm_t.std(unbiased=False).clamp(min=1e-6)
+                prior_norm_t = (prior_norm_t - prior_mean) / prior_std
+            rank_scores_t = rank_scores_t - alpha * prior_norm_t
+        else:
+            prior_norm_t = prior_t
 
         scores = raw_scores_t.cpu().numpy()
         rank_scores = rank_scores_t.cpu().numpy()
         prior_np = prior_t.cpu().numpy()
+        specificity_np = specificity_t.cpu().numpy()
 
     # Protein targets for a small curated set of diseases.
     # Use exact normalized disease-name matching only (no broad substring fallback).
@@ -543,6 +583,7 @@ def predict(req: PredictionRequest):
         gnn_score = float(scores[idx])
         rank_score = float(rank_scores[idx])
         prior_component = float(prior_np[idx])
+        specificity_component = float(specificity_np[idx])
 
         # Real degree information (not fake docking)
         drug_degree = float(degrees[drug_idx].item())
@@ -566,6 +607,7 @@ def predict(req: PredictionRequest):
             "gnn_score": round(gnn_score, 4),
             "rank_score": round(rank_score, 4),
             "global_prior": round(prior_component, 4),
+            "specificity": round(specificity_component, 4),
             "degree": int(drug_degree),
             "degree_bucket": degree_bucket,
             "ligand_url": ligand_url
@@ -590,6 +632,15 @@ def predict(req: PredictionRequest):
         "rerank_settings": {
             "use_debias_rerank": bool(req.use_debias_rerank),
             "debias_alpha": round(float(max(0.0, min(req.debias_alpha, 1.5))), 4),
+            "use_specificity_rerank": bool(req.use_specificity_rerank),
+            "specificity_beta": round(float(max(0.0, min(req.specificity_beta, 3.0))), 4),
+            "use_hub_penalty": bool(req.use_hub_penalty),
+            "hub_degree_quantile": round(float(max(0.5, min(req.hub_degree_quantile, 0.99))), 4),
+            "hub_penalty_factor": round(float(max(0.1, min(req.hub_penalty_factor, 1.0))), 4),
+            "hub_degree_threshold": (
+                round(float(hub_threshold_value), 4) if hub_threshold_value is not None else None
+            ),
+            "use_disease_zscore": bool(req.use_disease_zscore),
             "prior_sampled_diseases": int(prior_sampled_diseases),
         },
     }

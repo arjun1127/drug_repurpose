@@ -73,9 +73,18 @@ class TrainConfig:
     patience: int = 15
     degree_corr_lambda: float = 0.02
 
-    # BPR loss configuration
-    bpr_weight: float = 1.0          # Weight for BPR ranking loss
-    bce_weight: float = 0.3          # Weight for BCE calibration loss (lower since BPR is primary)
+    # Ranking + calibration loss configuration
+    # Final loss: bce_weight * BCE + bpr_weight * BPR + margin_rank_weight * MarginRank + degree reg
+    bce_weight: float = 1.0
+    bpr_weight: float = 0.8
+    margin_rank_weight: float = 0.35
+    margin_rank_margin: float = 0.5
+
+    # BCE training negatives: source mix (normalized internally).
+    train_neg_random_fraction: float = 0.5
+    train_neg_contra_fraction: float = 0.3
+    train_neg_hard_fraction: float = 0.2
+
     bpr_neg_per_pos: int = 5         # Negative drugs sampled per positive for BPR pairs
     hard_neg_fraction: float = 0.5   # Fraction of BPR negatives that are hard (model-scored)
     hard_neg_start_epoch: int = 20   # Start hard negatives after this many epochs (warmup)
@@ -120,8 +129,28 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--bpr-weight", type=float, default=1.0, help="BPR ranking loss weight")
-    parser.add_argument("--bce-weight", type=float, default=0.3, help="BCE calibration loss weight")
+    parser.add_argument("--bpr-weight", type=float, default=0.8, help="BPR ranking loss weight")
+    parser.add_argument("--bce-weight", type=float, default=1.0, help="BCE calibration loss weight")
+    parser.add_argument("--margin-rank-weight", type=float, default=0.35, help="Margin ranking loss weight")
+    parser.add_argument("--margin-rank-margin", type=float, default=0.5, help="Margin ranking margin")
+    parser.add_argument(
+        "--train-neg-random-frac",
+        type=float,
+        default=0.5,
+        help="Training-negative mix fraction: unknown random negatives.",
+    )
+    parser.add_argument(
+        "--train-neg-contra-frac",
+        type=float,
+        default=0.3,
+        help="Training-negative mix fraction: contraindication negatives.",
+    )
+    parser.add_argument(
+        "--train-neg-hard-frac",
+        type=float,
+        default=0.2,
+        help="Training-negative mix fraction: hard model-mined negatives.",
+    )
     parser.add_argument("--run-tsne", action="store_true", help="Enable t-SNE plot (uses extra memory)")
     args = parser.parse_args()
 
@@ -137,6 +166,11 @@ def parse_args() -> TrainConfig:
         eval_every=args.eval_every,
         bpr_weight=args.bpr_weight,
         bce_weight=args.bce_weight,
+        margin_rank_weight=args.margin_rank_weight,
+        margin_rank_margin=args.margin_rank_margin,
+        train_neg_random_fraction=max(0.0, args.train_neg_random_frac),
+        train_neg_contra_fraction=max(0.0, args.train_neg_contra_frac),
+        train_neg_hard_fraction=max(0.0, args.train_neg_hard_frac),
         skip_tsne=not args.run_tsne,
     )
     config.dataset_path = config.data_dir / "primekg.csv"
@@ -698,6 +732,126 @@ def sample_negative_edges(
     return negatives
 
 
+def allocate_negative_targets(
+    total_target: int,
+    contra_fraction: float,
+    random_fraction: float,
+    hard_fraction: float,
+) -> Tuple[int, int, int]:
+    if total_target <= 0:
+        return 0, 0, 0
+
+    weights = np.array(
+        [max(contra_fraction, 0.0), max(random_fraction, 0.0), max(hard_fraction, 0.0)],
+        dtype=np.float64,
+    )
+    if float(weights.sum()) <= 0:
+        weights = np.array([0.3, 0.5, 0.2], dtype=np.float64)
+
+    weights = weights / float(weights.sum())
+    raw = weights * float(total_target)
+    counts = np.floor(raw).astype(np.int64)
+    remainder = int(total_target - int(counts.sum()))
+
+    if remainder > 0:
+        fractional = raw - counts
+        order = np.argsort(fractional)[::-1]
+        for i in order[:remainder]:
+            counts[int(i)] += 1
+
+    contra_target = int(counts[0])
+    random_target = int(counts[1])
+    hard_target = int(counts[2])
+    return contra_target, random_target, hard_target
+
+
+def tensor_pairs_to_edge_list(pairs: torch.Tensor) -> List[Tuple[int, int]]:
+    if pairs.numel() == 0:
+        return []
+
+    pairs_cpu = pairs.detach().cpu()
+    out: List[Tuple[int, int]] = []
+    for i in range(pairs_cpu.shape[1]):
+        out.append((int(pairs_cpu[0, i]), int(pairs_cpu[1, i])))
+    return out
+
+
+def compose_train_negatives(
+    contra_edges: Sequence[Tuple[int, int]],
+    random_edges: Sequence[Tuple[int, int]],
+    hard_edges: Sequence[Tuple[int, int]],
+    total_target: int,
+    contra_target: int,
+    random_target: int,
+    hard_target: int,
+    therapeutic_drug_nodes_np: np.ndarray,
+    disease_nodes_np: np.ndarray,
+    drug_probs: np.ndarray,
+    blocked_known_pairs: Set[Tuple[int, int]],
+    rng: np.random.Generator,
+    split_name: str,
+) -> Tuple[List[Tuple[int, int]], Dict[str, int]]:
+    out: List[Tuple[int, int]] = []
+    seen: Set[Tuple[int, int]] = set()
+
+    def add_from_pool(pool: Sequence[Tuple[int, int]], target: int) -> int:
+        if target <= 0 or not pool:
+            return 0
+
+        added = 0
+        order = rng.permutation(len(pool))
+        for idx in order:
+            pair = pool[int(idx)]
+            normalized_pair = (int(pair[0]), int(pair[1]))
+            if normalized_pair in blocked_known_pairs or normalized_pair in seen:
+                continue
+            seen.add(normalized_pair)
+            out.append(normalized_pair)
+            added += 1
+            if added >= target:
+                break
+        return added
+
+    used_hard = add_from_pool(hard_edges, hard_target)
+    used_contra = add_from_pool(contra_edges, contra_target)
+    used_random = add_from_pool(random_edges, random_target)
+
+    missing = max(total_target - len(out), 0)
+    topup_count = 0
+    if missing > 0:
+        blocked_for_topup = set(blocked_known_pairs)
+        blocked_for_topup.update(seen)
+        topup = sample_negative_edges(
+            num_samples=missing,
+            drug_nodes_np=therapeutic_drug_nodes_np,
+            disease_nodes_np=disease_nodes_np,
+            drug_probs=drug_probs,
+            blocked_pairs=blocked_for_topup,
+            rng=rng,
+            split_name=f"{split_name}_topup",
+        )
+        for pair in topup:
+            normalized_pair = (int(pair[0]), int(pair[1]))
+            if normalized_pair in seen:
+                continue
+            seen.add(normalized_pair)
+            out.append(normalized_pair)
+            topup_count += 1
+            if len(out) >= total_target:
+                break
+
+    if len(out) > total_target:
+        out = out[:total_target]
+
+    mix_stats = {
+        "contra": int(used_contra),
+        "random": int(used_random),
+        "hard": int(used_hard),
+        "topup": int(topup_count),
+    }
+    return out, mix_stats
+
+
 def create_pair_tensors(
     pos_edges: Sequence[Tuple[int, int]],
     neg_edges: Sequence[Tuple[int, int]],
@@ -887,6 +1041,17 @@ def bpr_loss(
     Loss = -log(sigmoid(pos_score - neg_score)), averaged.
     """
     return -F.logsigmoid(pos_scores - neg_scores).mean()
+
+
+def margin_ranking_loss(
+    pos_scores: torch.Tensor,
+    neg_scores: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+        return pos_scores.new_tensor(0.0)
+    target = torch.ones_like(pos_scores)
+    return F.margin_ranking_loss(pos_scores, neg_scores, target, margin=margin)
 
 
 def build_bpr_pairs(
@@ -1573,15 +1738,6 @@ def main() -> None:
         f"Test: {len(test_contra):,}"
     )
 
-    # Training negatives stay strictly typed (contraindications).
-    train_neg = sample_edges_to_target(
-        edges=train_contra,
-        target_count=int(len(train_pos) * config.negative_ratio),
-        rng=rng,
-        split_name="train",
-        relation_name="contraindication",
-    )
-
     # Signed message-passing graph:
     # +1 for TREATS, -1 for CONTRAINDICATION, +1 for non-drug-disease structure.
     base_edge_index, base_edge_weight = build_train_base_edge_index(
@@ -1620,6 +1776,65 @@ def main() -> None:
     # can never include a known treatment edge.
     blocked_pairs: Set[Tuple[int, int]] = set(positive_edges)
     blocked_known_pairs = set(positive_edges).union(set(contraindication_edges))
+    therapeutic_drug_nodes_np = therapeutic_drug_nodes.detach().cpu().numpy()
+
+    train_neg_target_total = int(len(train_pos) * config.negative_ratio)
+    train_neg_contra_target, train_neg_random_target, train_neg_hard_target = allocate_negative_targets(
+        total_target=train_neg_target_total,
+        contra_fraction=config.train_neg_contra_fraction,
+        random_fraction=config.train_neg_random_fraction,
+        hard_fraction=config.train_neg_hard_fraction,
+    )
+    print(
+        "Train negative mix targets | "
+        f"total={train_neg_target_total:,} "
+        f"contra={train_neg_contra_target:,} "
+        f"random={train_neg_random_target:,} "
+        f"hard={train_neg_hard_target:,}"
+    )
+
+    train_neg_contra = sample_edges_to_target(
+        edges=train_contra,
+        target_count=train_neg_contra_target,
+        rng=rng,
+        split_name="train",
+        relation_name="contraindication",
+    )
+    blocked_for_train_random = set(blocked_known_pairs)
+    blocked_for_train_random.update(train_neg_contra)
+    train_neg_random = sample_negative_edges(
+        num_samples=train_neg_random_target,
+        drug_nodes_np=therapeutic_drug_nodes_np,
+        disease_nodes_np=disease_nodes_np,
+        drug_probs=drug_sampling_probs,
+        blocked_pairs=blocked_for_train_random,
+        rng=rng,
+        split_name="train_random",
+    )
+
+    train_neg, train_mix_stats = compose_train_negatives(
+        contra_edges=train_neg_contra,
+        random_edges=train_neg_random,
+        hard_edges=[],
+        total_target=train_neg_target_total,
+        contra_target=train_neg_contra_target,
+        random_target=train_neg_random_target,
+        hard_target=train_neg_hard_target,
+        therapeutic_drug_nodes_np=therapeutic_drug_nodes_np,
+        disease_nodes_np=disease_nodes_np,
+        drug_probs=drug_sampling_probs,
+        blocked_known_pairs=blocked_known_pairs,
+        rng=rng,
+        split_name="train",
+    )
+    print(
+        "Initial train-negative composition | "
+        f"contra={train_mix_stats['contra']:,} "
+        f"random={train_mix_stats['random']:,} "
+        f"hard={train_mix_stats['hard']:,} "
+        f"topup={train_mix_stats['topup']:,} "
+        f"final={len(train_neg):,}"
+    )
 
     val_neg = compose_eval_negatives(
         typed_edges=val_contra,
@@ -1647,7 +1862,6 @@ def main() -> None:
     test_contra_set = set(test_contra)
     val_neg_typed = sum(1 for pair in val_neg if pair in val_contra_set)
     test_neg_typed = sum(1 for pair in test_neg if pair in test_contra_set)
-    del drug_sampling_probs
 
     train_pairs, train_labels = create_pair_tensors(train_pos, train_neg, device)
     val_pairs, val_labels = create_pair_tensors(val_pos, val_neg, device)
@@ -1660,7 +1874,7 @@ def main() -> None:
         f"Test: {test_pairs.shape[1]:,}"
     )
 
-    # Build initial BPR pairs from typed contraindication negatives.
+    # Build initial ranking pairs from mixed train negatives.
     bpr_pos_pairs, bpr_neg_pairs = build_bpr_pairs(
         pos_edges=train_pos,
         neg_edges=train_neg,
@@ -1700,15 +1914,14 @@ def main() -> None:
     drug_nodes_device = node_artifacts.drug_nodes.to(device)
     disease_nodes_device = node_artifacts.disease_nodes.to(device)
     therapeutic_drug_nodes_device = therapeutic_drug_nodes.to(device)
-    train_neg_by_disease = group_drugs_by_disease(train_neg)
-    global_train_neg_drugs = sorted({int(drug_idx) for drug_idx, _ in train_neg})
-
     history: Dict[str, List[float]] = defaultdict(list)
 
     best_val_mrr = -math.inf
     best_epoch = -1
     best_val_snapshot: Dict[str, float] = {}
     patience_counter = 0
+    hard_neg_cache: List[Tuple[int, int]] = []
+    latest_train_mix_stats = dict(train_mix_stats)
 
     for epoch in range(1, config.epochs + 1):
         model.train()
@@ -1716,7 +1929,10 @@ def main() -> None:
 
         # ── Hard negative refresh ──
         use_hard = epoch >= config.hard_neg_start_epoch
-        if use_hard and epoch % config.hard_neg_refresh == 0:
+        should_refresh_hard = use_hard and (
+            epoch == config.hard_neg_start_epoch or epoch % config.hard_neg_refresh == 0
+        )
+        if should_refresh_hard:
             model.eval()
             with torch.no_grad():
                 z_for_mining = model.encode(node_type_ids, static_adj)
@@ -1731,40 +1947,63 @@ def main() -> None:
                 neg_per_pos=config.bpr_neg_per_pos,
                 batch_size=config.batch_size,
                 rng=rng,
-                candidate_neg_by_disease=train_neg_by_disease,
-                candidate_global_neg_drugs=global_train_neg_drugs,
             )
-            if hard_pos.shape[1] > 0:
-                hard_pos = hard_pos.to(device)
-                hard_neg = hard_neg.to(device)
-
-                # Mix: hard_neg_fraction of hard + rest random
-                n_hard = hard_pos.shape[1]
-                n_rand = bpr_pos_pairs.shape[1]
-                n_hard_use = int(n_hard * config.hard_neg_fraction)
-                # Combine: first N hard pairs + random pairs
-                bpr_pos_mixed = torch.cat([hard_pos[:, :n_hard_use], bpr_pos_pairs], dim=1)
-                bpr_neg_mixed = torch.cat([hard_neg[:, :n_hard_use], bpr_neg_pairs], dim=1)
-                print(f"  [Epoch {epoch}] Hard negatives mined: {n_hard_use:,} hard + {n_rand:,} random = {bpr_pos_mixed.shape[1]:,} total BPR pairs")
+            if hard_neg.shape[1] > 0:
+                mined_hard_edges = tensor_pairs_to_edge_list(hard_neg)
+                # Keep unique hard edges in mined score order.
+                hard_neg_cache = list(dict.fromkeys(mined_hard_edges))
+                print(
+                    f"  [Epoch {epoch}] Hard negatives mined: {len(hard_neg_cache):,} unique edges"
+                )
             else:
-                bpr_pos_mixed = bpr_pos_pairs
-                bpr_neg_mixed = bpr_neg_pairs
+                hard_neg_cache = []
             model.train()
-        elif not use_hard or epoch == 1:
-            bpr_pos_mixed = bpr_pos_pairs
-            bpr_neg_mixed = bpr_neg_pairs
+
+        # Rebuild train negatives each epoch to keep ranking signal fresh.
+        train_neg, latest_train_mix_stats = compose_train_negatives(
+            contra_edges=train_neg_contra,
+            random_edges=train_neg_random,
+            hard_edges=hard_neg_cache if use_hard else [],
+            total_target=train_neg_target_total,
+            contra_target=train_neg_contra_target,
+            random_target=train_neg_random_target,
+            hard_target=train_neg_hard_target if use_hard else 0,
+            therapeutic_drug_nodes_np=therapeutic_drug_nodes_np,
+            disease_nodes_np=disease_nodes_np,
+            drug_probs=drug_sampling_probs,
+            blocked_known_pairs=blocked_known_pairs,
+            rng=rng,
+            split_name="train",
+        )
+        train_pairs, train_labels = create_pair_tensors(train_pos, train_neg, device)
+
+        # Ranking supervision uses the same epoch negatives.
+        bpr_pos_pairs, bpr_neg_pairs = build_bpr_pairs(
+            pos_edges=train_pos,
+            neg_edges=train_neg,
+            neg_per_pos=config.bpr_neg_per_pos,
+            rng=rng,
+            allow_global_fallback=True,
+        )
+        bpr_pos_pairs = bpr_pos_pairs.to(device)
+        bpr_neg_pairs = bpr_neg_pairs.to(device)
 
         # ── Forward pass ──
         z_train = model.encode(node_type_ids, static_adj)
 
-        # BPR ranking loss: score(pos_drug) should exceed score(neg_drug) for same disease.
-        # If typed negatives are unavailable for this batch, skip BPR safely.
-        if bpr_pos_mixed.shape[1] == 0:
+        # Ranking losses: BPR + margin ranking.
+        if bpr_pos_pairs.shape[1] == 0:
             loss_bpr = torch.tensor(0.0, device=device)
+            loss_margin = torch.tensor(0.0, device=device)
         else:
-            bpr_pos_scores = model.score(z_train, bpr_pos_mixed, degree_tensor)
-            bpr_neg_scores = model.score(z_train, bpr_neg_mixed, degree_tensor)
+            bpr_pos_scores = model.score(z_train, bpr_pos_pairs, degree_tensor)
+            bpr_neg_scores = model.score(z_train, bpr_neg_pairs, degree_tensor)
             loss_bpr = bpr_loss(bpr_pos_scores, bpr_neg_scores)
+            loss_margin = margin_ranking_loss(
+                pos_scores=bpr_pos_scores,
+                neg_scores=bpr_neg_scores,
+                margin=float(config.margin_rank_margin),
+            )
 
         # BCE calibration loss (keeps scores calibrated 0-1)
         train_logits = model.score(z_train, train_pairs, degree_tensor)
@@ -1773,10 +2012,11 @@ def main() -> None:
         # Degree correlation regularizer
         degree_corr_penalty = degree_correlation_regularizer(train_logits, train_pairs, degree_tensor)
 
-        # Combined loss: BPR for ranking + BCE for calibration + degree reg
+        # Combined loss: stronger ranking supervision + calibration + anti-degree shortcut.
         loss = (
-            config.bpr_weight * loss_bpr
-            + config.bce_weight * loss_bce
+            config.bce_weight * loss_bce
+            + config.bpr_weight * loss_bpr
+            + config.margin_rank_weight * loss_margin
             + config.degree_corr_lambda * degree_corr_penalty
         )
 
@@ -1822,8 +2062,13 @@ def main() -> None:
         history["lr"].append(float(current_lr))
         history["train_loss"].append(float(loss.item()))
         history["train_bpr_loss"].append(float(loss_bpr.item()))
+        history["train_margin_loss"].append(float(loss_margin.item()))
         history["train_bce_loss"].append(float(loss_bce.item()))
         history["train_degree_corr_penalty"].append(float(degree_corr_penalty.item()))
+        history["train_neg_contra"].append(float(latest_train_mix_stats.get("contra", 0)))
+        history["train_neg_random"].append(float(latest_train_mix_stats.get("random", 0)))
+        history["train_neg_hard"].append(float(latest_train_mix_stats.get("hard", 0)))
+        history["train_neg_topup"].append(float(latest_train_mix_stats.get("topup", 0)))
         history["val_loss"].append(float(val_loss))
         history["val_auc"].append(float(val_binary["auc"]))
         history["val_ap"].append(float(val_binary["ap"]))
@@ -1834,10 +2079,12 @@ def main() -> None:
             f"Epoch {epoch:03d} | "
             f"loss={loss.item():.4f} "
             f"bpr={loss_bpr.item():.4f} "
+            f"margin={loss_margin.item():.4f} "
             f"bce={loss_bce.item():.4f} "
             f"val_mrr={val_ranking['mrr']:.4f} "
             f"hits@10={val_ranking['hits@10']:.4f} "
             f"auc={val_binary['auc']:.4f} "
+            f"hard={int(latest_train_mix_stats.get('hard', 0)):,} "
             f"lr={current_lr:.2e}"
         )
 
@@ -1979,6 +2226,13 @@ def main() -> None:
             "val_pos": len(val_pos),
             "test_pos": len(test_pos),
             "train_neg": len(train_neg),
+            "train_neg_target_total": train_neg_target_total,
+            "train_neg_target_contra": train_neg_contra_target,
+            "train_neg_target_random": train_neg_random_target,
+            "train_neg_target_hard": train_neg_hard_target,
+            "train_neg_pool_contra_sampled": len(train_neg_contra),
+            "train_neg_pool_random_sampled": len(train_neg_random),
+            "train_neg_last_epoch_hard_used": int(latest_train_mix_stats.get("hard", 0)),
             "val_neg": len(val_neg),
             "test_neg": len(test_neg),
             "val_neg_typed_contra": val_neg_typed,
