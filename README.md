@@ -52,31 +52,41 @@ Latest run statistics from `models/training_metrics.json`:
 ## How We Tackled Problems (Problem -> Solution)
 This is the actual decision path reflected in code.
 
-| Label leakage risk in message passing | 
-|If val/test drug-disease edges are in adjacency, model can indirectly "see answers" |
-|Built adjacency from non-drug-disease edges + train-only therapeutic/contra edges |
-| Generic hubs dominating rankings | High-degree drugs get high scores for many diseases |
-|Added degree-aware scorer features, degree-correlation penalty, and inference-time prior subtraction |
-| Binary classification alone was weak for ranking |
-|AUC can look okay while top-k disease-specific ranking stays poor | 
-|Added BPR ranking loss as primary objective plus BCE for probability calibration |
-| Easy negatives gave weak learning signal | 
-|Model needs hard "looks plausible but wrong" negatives | 
-|Added periodic hard negative mining and mixed hard + random BPR pairs |
-| Non-therapeutic compounds surfaced as candidates |
-|Many graph drug nodes are not practical therapeutics |
-|Candidate whitelist built from indication/off-label/contra drug participation |
-| Contradictory labels exist in raw KG |
-|Same pair marked as treat and contraindication creates noisy supervision | 
-|Detected and removed 123 conflicting pairs from both sets |
-| Explainability gap | Model gives scores but no "why" |
-|Implemented `/explain` endpoint with L2/L3 path search between drug and disease |
-| Domain-specific filtering | 
-|Biologists may want to exclude certain classes (e.g. topical only) | 
-|Added category-based filtering using `DRUG_CATEGORIES` mapping |
-| Rigid hub-bias penalty | 
-|Static penalty can over-penalize high-degree drugs for some users | 
-|Introduced `orphan_cap` slider for dynamic inference-time control |
+* **Label leakage risk in message passing**
+  * **Problem:** If val/test drug-disease edges are in adjacency, the model can indirectly "see answers".
+  * **Solution:** Built adjacency from non-drug-disease edges + train-only therapeutic/contra edges.
+
+* **Generic hubs dominating rankings**
+  * **Problem:** High-degree drugs get high scores for many diseases.
+  * **Solution:** Added degree-aware scorer features, degree-correlation penalty, and inference-time prior subtraction.
+
+* **Binary classification alone was weak for ranking**
+  * **Problem:** AUC can look okay while top-k disease-specific ranking stays poor.
+  * **Solution:** Added BPR ranking loss as primary objective plus BCE for probability calibration.
+
+* **Easy negatives gave weak learning signal**
+  * **Problem:** Model needs hard "looks plausible but wrong" negatives.
+  * **Solution:** Added periodic hard negative mining and mixed hard + random BPR pairs.
+
+* **Non-therapeutic compounds surfaced as candidates**
+  * **Problem:** Many graph drug nodes are not practical therapeutics.
+  * **Solution:** Candidate whitelist built from indication/off-label/contra drug participation.
+
+* **Contradictory labels exist in raw KG**
+  * **Problem:** Same pair marked as treat and contraindication creates noisy supervision.
+  * **Solution:** Detected and removed 123 conflicting pairs from both sets.
+
+* **Explainability gap**
+  * **Problem:** Model gives scores but no "why".
+  * **Solution:** Implemented `/explain` endpoint with L2/L3 path search between drug and disease.
+
+* **Domain-specific filtering**
+  * **Problem:** Biologists may want to exclude certain classes (e.g., topical only).
+  * **Solution:** Added category-based filtering using `DRUG_CATEGORIES` mapping.
+
+* **Rigid hub-bias penalty**
+  * **Problem:** Static penalty can over-penalize high-degree drugs for some users.
+  * **Solution:** Introduced `orphan_cap` slider for dynamic inference-time control.
 
 ## GCN Model Details
 Implementation: `gnn_drug_repurposing_improved.py`
