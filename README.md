@@ -293,7 +293,7 @@ source backend/venv/bin/activate
 ### activate the venv before running this
 source backend/venv/bin/activate 
 
-```bash
+```
 python3 gnn_drug_repurposing_improved.py --device auto --epochs 200
 ```
 
