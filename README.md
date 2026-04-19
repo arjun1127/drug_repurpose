@@ -258,9 +258,10 @@ Effect:
 - Frontend: React/Vite app with discovery, performance, and bias tabs for interactive inspection.
 
 ## Reproduce
-### Activate the env in the backend folder 
-```linux
-souce backend/venv/bin/activate
+### Activate the env in the backend folder
+linux
+```
+source backend/venv/bin/activate
 ```
 ### Train
 ```bash
