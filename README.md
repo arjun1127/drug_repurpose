@@ -258,6 +258,10 @@ Effect:
 - Frontend: React/Vite app with discovery, performance, and bias tabs for interactive inspection.
 
 ## Reproduce
+### Activate the env in the backend folder 
+```linux
+souce backend/venv/bin/activate
+```
 ### Train
 ```bash
 python3 gnn_drug_repurposing_improved.py --device auto --epochs 200
