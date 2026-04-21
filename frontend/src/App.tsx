@@ -6,7 +6,7 @@ import {
   Activity, Dna, FileEdit,
   BarChart3, Shield, TrendingUp, Layers,
   CheckCircle, AlertTriangle, Zap, Target,
-  GitBranch
+  GitBranch, Sparkles, Info
 } from 'lucide-react';
 import './index.css';
 import { MolecularViewer } from './components/MolecularViewer';
@@ -330,6 +330,56 @@ function App() {
               </form>
             </div>
 
+            {results && (
+              <motion.div
+                className="summary-panel"
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.5 }}
+              >
+                <div className="summary-header">
+                  <div className="summary-title">
+                    <Sparkles size={18} color="var(--primary)" />
+                    Top Candidates for <span>{results.disease}</span>
+                  </div>
+                  <div className="summary-stats">
+                    <div className="summary-stat-item">
+                      <Target size={14} />
+                      Candidates: <span className="summary-stat-value">{results.predictions.length}</span>
+                    </div>
+                    {results.targets.length > 0 && (
+                      <div className="summary-stat-item">
+                        <Dna size={14} />
+                        Proteins: <span className="summary-stat-value">{results.targets.length}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="summary-chips">
+                  {results.predictions.slice(0, 5).map((pred, idx) => (
+                    <div 
+                      key={pred.drug_name} 
+                      className="summary-chip"
+                      onClick={() => {
+                        const element = document.getElementById(`drug-card-${idx}`);
+                        if (element) element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                      }}
+                    >
+                      <div className="summary-chip-rank">{idx + 1}</div>
+                      <div className="summary-chip-name">{pred.drug_name}</div>
+                      <div className="summary-chip-score">{pred.gnn_score.toFixed(3)}</div>
+                    </div>
+                  ))}
+                  {results.predictions.length > 5 && (
+                    <div className="summary-chip" style={{ cursor: 'default', opacity: 0.7 }}>
+                      <Info size={14} />
+                      <div className="summary-chip-name">+{results.predictions.length - 5} more</div>
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+
             <div style={{ display: 'flex', gap: '2rem', marginBottom: '2rem', padding: '1.5rem', background: 'rgba(30,41,59,0.3)', borderRadius: '12px', flexWrap: 'wrap', border: '1px solid rgba(255,255,255,0.05)' }}>
               <div style={{ flex: 1, minWidth: '250px' }}>
                 <h4 style={{ marginBottom: '1rem', color: '#e2e8f0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
@@ -473,6 +523,7 @@ function App() {
                   {results.predictions.map((pred, idx) => (
                     <motion.div
                       key={pred.drug_name}
+                      id={`drug-card-${idx}`}
                       className="drug-card"
                       initial={{ y: 50, opacity: 0 }}
                       animate={{ y: 0, opacity: 1 }}
