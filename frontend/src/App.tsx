@@ -30,6 +30,15 @@ interface Prediction {
   degree: number;
   degree_bucket: 'low' | 'medium' | 'high' | 'unknown';
   ligand_url?: string;
+  rationale?: string;
+  biological_confidence?: 'high' | 'medium' | 'low';
+  protein_targets?: {
+    direct_targets: string[];
+    enzymes: string[];
+    transporters: string[];
+    carriers: string[];
+  };
+  shared_disease_proteins?: string[];
 }
 
 interface DiseaseCandidate {
@@ -230,10 +239,10 @@ function App() {
       setExplanations(newExps);
       return;
     }
-    
+
     const diseaseIdx = results?.selected_disease_node_idx ?? results?.disease_candidates?.[0]?.disease_node_idx;
     if (diseaseIdx === undefined) return;
-    
+
     setLoadingExplanations(prev => ({ ...prev, [drugName]: true }));
     try {
       const res = await axios.post(`${API_URL}/explain`, {
@@ -357,8 +366,8 @@ function App() {
                 </div>
                 <div className="summary-chips">
                   {results.predictions.slice(0, 5).map((pred, idx) => (
-                    <div 
-                      key={pred.drug_name} 
+                    <div
+                      key={pred.drug_name}
                       className="summary-chip"
                       onClick={() => {
                         const element = document.getElementById(`drug-card-${idx}`);
@@ -568,6 +577,25 @@ function App() {
                           </div>
                         </div>
 
+                        {/* Biological Confidence */}
+                        {pred.biological_confidence && (
+                          <div className="metric" style={{ marginTop: '0.8rem', padding: '0.6rem', background: 'rgba(255,255,255,0.03)', borderRadius: '6px' }}>
+                            <div className="metric-header" style={{ marginBottom: '0.4rem' }}>
+                              <span className="metric-label" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: pred.biological_confidence === 'high' ? '#34d399' : pred.biological_confidence === 'medium' ? '#fbbf24' : '#94a3b8' }}>
+                                <Shield size={14} /> Biological Evidence
+                              </span>
+                              <span style={{ fontSize: '0.75rem', fontWeight: 'bold', textTransform: 'uppercase', color: pred.biological_confidence === 'high' ? '#34d399' : pred.biological_confidence === 'medium' ? '#fbbf24' : '#94a3b8' }}>
+                                {pred.biological_confidence}
+                              </span>
+                            </div>
+                            {pred.rationale && (
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                                {pred.rationale}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
                         {/* Actions Toggle */}
                         <div style={{ marginTop: '0.5rem', paddingTop: '0.8rem', borderTop: '1px solid rgba(255,255,255,0.05)', display: 'flex', gap: '0.5rem' }}>
                           <button
@@ -583,7 +611,7 @@ function App() {
                             {loadingExplanations[pred.drug_name] ? <Loader2 size={14} className="animate-spin" /> : <Layers size={14} />}
                             {explanations[pred.drug_name] ? 'Hide Path' : 'Explain'}
                           </button>
-                          
+
                           {pred.ligand_url && (
                             <button
                               onClick={() => toggleViewer(pred.drug_name)}
@@ -616,28 +644,28 @@ function App() {
                               {explanations[pred.drug_name].length === 0 ? (
                                 <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>No direct paths found (requires deeper search).</div>
                               ) : (
-                                  <ul style={{ margin: 0, paddingLeft: '0.5rem', fontSize: '0.8rem', color: '#cbd5e1', listStyle: 'none' }}>
-                                    {explanations[pred.drug_name].map((pathObj, pidx) => (
-                                      <li key={pidx} style={{ marginBottom: '0.6rem', display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
-                                        <span style={{ 
-                                          fontSize: '0.65rem', 
-                                          background: pathObj.path_len === 2 ? 'rgba(52, 211, 153, 0.2)' : 'rgba(251, 191, 36, 0.2)', 
-                                          color: pathObj.path_len === 2 ? '#34d399' : '#fbbf24',
-                                          padding: '1px 4px',
-                                          borderRadius: '4px',
-                                          marginTop: '2px',
-                                          fontWeight: 'bold'
-                                        }}>
-                                          L{pathObj.path_len}
-                                        </span>
-                                        <div>
-                                          <span style={{ color: '#60a5fa' }}>{pred.drug_name}</span> ➔{' '}
-                                          <span style={{ color: '#a78bfa' }}>[{pathObj.shared_node_type}]</span> {pathObj.shared_node_name} ➔{' '}
-                                          <span style={{ color: '#f472b6' }}>{results?.disease}</span>
-                                        </div>
-                                      </li>
-                                    ))}
-                                  </ul>
+                                <ul style={{ margin: 0, paddingLeft: '0.5rem', fontSize: '0.8rem', color: '#cbd5e1', listStyle: 'none' }}>
+                                  {explanations[pred.drug_name].map((pathObj, pidx) => (
+                                    <li key={pidx} style={{ marginBottom: '0.6rem', display: 'flex', alignItems: 'flex-start', gap: '0.5rem' }}>
+                                      <span style={{
+                                        fontSize: '0.65rem',
+                                        background: pathObj.path_len === 2 ? 'rgba(52, 211, 153, 0.2)' : 'rgba(251, 191, 36, 0.2)',
+                                        color: pathObj.path_len === 2 ? '#34d399' : '#fbbf24',
+                                        padding: '1px 4px',
+                                        borderRadius: '4px',
+                                        marginTop: '2px',
+                                        fontWeight: 'bold'
+                                      }}>
+                                        L{pathObj.path_len}
+                                      </span>
+                                      <div>
+                                        <span style={{ color: '#60a5fa' }}>{pred.drug_name}</span> ➔{' '}
+                                        <span style={{ color: '#a78bfa' }}>[{pathObj.shared_node_type}]</span> {pathObj.shared_node_name} ➔{' '}
+                                        <span style={{ color: '#f472b6' }}>{results?.disease}</span>
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ul>
                               )}
                             </motion.div>
                           )}
@@ -821,8 +849,8 @@ function App() {
                       {metrics.bias.spearman_rho > 0.5
                         ? ' ⚠️ Significant hub bias remains — high-degree drugs dominate predictions.'
                         : metrics.bias.spearman_rho > 0.3
-                        ? ' ⚠️ Moderate hub bias remains.'
-                        : ' ✅ Hub bias is currently controlled.'}
+                          ? ' ⚠️ Moderate hub bias remains.'
+                          : ' ✅ Hub bias is currently controlled.'}
                     </div>
                   </motion.div>
 

@@ -70,12 +70,12 @@ class TrainConfig:
     negative_drug_weight_power: float = -1.0
 
     batch_size: int = 2048
-    patience: int = 15
-    degree_corr_lambda: float = 0.15
+    patience: int = 30
+    degree_corr_lambda: float = 0.3
 
     # Ranking + calibration loss configuration
     # Final loss: bpr_weight * BPR + degree reg
-    bce_weight: float = 0.0
+    bce_weight: float = 0.5
     bpr_weight: float = 1.0
     margin_rank_weight: float = 0.0
     margin_rank_margin: float = 0.5
@@ -300,6 +300,53 @@ def extract_entity_name_maps(df_raw: pd.DataFrame) -> Tuple[Dict[str, str], Dict
     ingest(c_y_id, c_y_type, c_y_name)
 
     return disease_id_to_name, drug_id_to_name
+
+
+def extract_drug_protein_targets(
+    df_raw: pd.DataFrame,
+    node_map: Dict[str, int],
+) -> Dict[int, List[Dict[str, str]]]:
+    """Extract drug → protein target relationships from PrimeKG.
+
+    Returns a dict mapping drug_node_idx → list of target protein info dicts.
+    Each dict has keys: protein_id, protein_name, relation (target/enzyme/transporter/carrier).
+    """
+    c_x_id = _pick_column(df_raw, ["x_id", "x_index", "source_id"], required=False)
+    c_y_id = _pick_column(df_raw, ["y_id", "y_index", "target_id"], required=False)
+    c_y_name = _pick_column(df_raw, ["y_name", "target_name", "ylabel"], required=False)
+    c_relation = _pick_column(df_raw, ["relation", "display_relation"], required=False)
+    c_display_rel = _pick_column(df_raw, ["display_relation"], required=False)
+
+    if c_x_id is None or c_y_id is None:
+        print("WARNING: Cannot extract drug-protein targets (missing columns)")
+        return {}
+
+    # Filter to drug_protein edges
+    mask = df_raw[c_relation].astype(str).str.lower() == "drug_protein"
+    dp_edges = df_raw[mask]
+
+    drug_targets: Dict[int, List[Dict[str, str]]] = {}
+
+    for _, row in dp_edges.iterrows():
+        drug_key = f"drug::{row[c_x_id]}"
+        if drug_key not in node_map:
+            continue
+        drug_idx = node_map[drug_key]
+
+        protein_id = str(row[c_y_id])
+        protein_name = str(row.get(c_y_name, "")) if c_y_name else protein_id
+        display_rel = str(row[c_display_rel]) if c_display_rel else "target"
+
+        if drug_idx not in drug_targets:
+            drug_targets[drug_idx] = []
+        drug_targets[drug_idx].append({
+            "protein_id": protein_id,
+            "protein_name": protein_name,
+            "relation": display_rel,
+        })
+
+    print(f"Extracted drug-protein targets: {len(drug_targets):,} drugs with {sum(len(v) for v in drug_targets.values()):,} targets")
+    return drug_targets
 
 
 def build_node_artifacts(df: pd.DataFrame) -> NodeArtifacts:
@@ -948,23 +995,26 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
         self.type_embedding = nn.Embedding(num_types, hidden_dim)
 
-        # 2 hidden RGCN stages with residual processing to reduce oversmoothing.
+        # RGCN encoder with 3 residual layers for deeper feature learning.
         self.gcn_in = RGCNConv(hidden_dim, hidden_dim, num_relations=3)
-        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(1)])
+        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(3)])
         self.gcn_out = RGCNConv(hidden_dim, embedding_dim, num_relations=3)
 
-        # src, dst, and elementwise product features (no degree features to avoid bias).
+        # Deeper link predictor: src, dst, elementwise product, and cosine similarity.
         self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 3, embedding_dim),
+            nn.Linear(embedding_dim * 3 + 1, embedding_dim * 2),
             nn.ReLU(),
-            nn.BatchNorm1d(embedding_dim),
+            nn.BatchNorm1d(embedding_dim * 2),
             nn.Dropout(dropout),
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(embedding_dim, 1),
         )
         
-        # Explicit learnable degree penalty scalars
-        self.degree_alpha = nn.Parameter(torch.tensor(0.1))
-        self.degree_beta = nn.Parameter(torch.tensor(0.1))
+        # Learnable additive degree penalty — subtracts from score, does NOT divide.
+        self.degree_alpha = nn.Parameter(torch.tensor(0.05))
+        self.degree_beta = nn.Parameter(torch.tensor(0.05))
 
     def encode(self, node_type_ids: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
         idx = torch.arange(len(node_type_ids), device=node_type_ids.device)
@@ -986,14 +1036,19 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         src_deg = degrees[src_idx].clamp(min=1).float()
         dst_deg = degrees[dst_idx].clamp(min=1).float()
 
-        features = torch.cat([src_z, dst_z, src_z * dst_z], dim=-1)
+        # Cosine similarity as additional disease-specificity signal
+        cos_sim = F.cosine_similarity(src_z, dst_z, dim=-1).unsqueeze(-1)
+
+        features = torch.cat([src_z, dst_z, src_z * dst_z, cos_sim], dim=-1)
         mlp_score = self.link_predictor(features).squeeze(-1)
         
-        # Explicit residual de-biasing to cancel hub advantage, plus normalize the MLP score
-        base_score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
-        normalized_score = base_score / (torch.sqrt(src_deg) * torch.sqrt(dst_deg) + 1e-8)
+        # Soft additive degree penalty — penalizes high-degree hubs WITHOUT
+        # collapsing the score range. The key fix: we SUBTRACT a scaled log-degree
+        # instead of DIVIDING by degree, which preserves the MLP's ability to
+        # distinguish treatments from non-treatments for any node.
+        score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
         
-        return normalized_score
+        return score
 
 
 def predict_logits(
@@ -1694,10 +1749,12 @@ def main() -> None:
     # -------------------------------
     df_raw, df = load_and_standardize_primekg(config)
     disease_id_to_name, drug_id_to_name = extract_entity_name_maps(df_raw)
+
+    # Build node map early so we can extract drug-protein targets before freeing df_raw.
+    node_artifacts = build_node_artifacts(df)
+    drug_protein_targets = extract_drug_protein_targets(df_raw, node_artifacts.node_map)
     del df_raw  # Free ~600MB of raw PrimeKG data
     gc.collect()
-
-    node_artifacts = build_node_artifacts(df)
     del df  # Free standardized DataFrame
     gc.collect()
     num_nodes = len(node_artifacts.all_keys)
@@ -2228,6 +2285,7 @@ def main() -> None:
         "contraindications_by_disease": group_drugs_by_disease(contraindication_edges),
         "disease_id_to_name": disease_id_to_name,
         "drug_id_to_name": drug_id_to_name,
+        "drug_protein_targets": drug_protein_targets,
     }
     with (config.models_dir / "metadata.pkl").open("wb") as file_obj:
         pickle.dump(metadata, file_obj)

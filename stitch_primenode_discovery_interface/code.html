@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>PrimeNode - Discovery Canvas</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Flex:opsz,wght@8..144,400;500;700&amp;family=Space+Grotesk:wght@500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+          darkMode: "class",
+          theme: {
+            extend: {
+              "colors": {
+                      "surface-container": "#211f26",
+                      "secondary-container": "#5e402b",
+                      "primary-container": "#a48afb",
+                      "inverse-on-surface": "#322f37",
+                      "surface-container-highest": "#36343b",
+                      "tertiary": "#96d3bd",
+                      "surface-container-high": "#2b2930",
+                      "on-secondary-fixed": "#2c1605",
+                      "surface-dim": "#141219",
+                      "background": "#141219",
+                      "on-tertiary-fixed": "#002118",
+                      "error": "#ffb4ab",
+                      "inverse-primary": "#654bb8",
+                      "on-secondary-container": "#d6ad92",
+                      "tertiary-container": "#6ba792",
+                      "on-primary": "#361287",
+                      "on-surface-variant": "#cac4d4",
+                      "on-tertiary-container": "#003b2d",
+                      "inverse-surface": "#e6e0ea",
+                      "outline": "#948e9e",
+                      "on-surface": "#e6e0ea",
+                      "on-primary-fixed-variant": "#4d319e",
+                      "error-container": "#93000a",
+                      "surface-container-low": "#1c1b21",
+                      "on-secondary": "#442a17",
+                      "surface-variant": "#36343b",
+                      "primary-fixed": "#e8deff",
+                      "primary": "#cdbdff",
+                      "on-secondary-fixed-variant": "#5e402b",
+                      "on-primary-fixed": "#20005f",
+                      "on-tertiary": "#00382b",
+                      "tertiary-fixed": "#b1efd8",
+                      "surface-tint": "#cdbdff",
+                      "on-background": "#e6e0ea",
+                      "surface": "#141219",
+                      "on-error": "#690005",
+                      "secondary-fixed-dim": "#e8bea2",
+                      "secondary": "#e8bea2",
+                      "tertiary-fixed-dim": "#96d3bd",
+                      "outline-variant": "#494552",
+                      "on-tertiary-fixed-variant": "#0d503f",
+                      "on-primary-container": "#39178a",
+                      "on-error-container": "#ffdad6",
+                      "surface-bright": "#3a3840",
+                      "surface-container-lowest": "#0f0d14",
+                      "primary-fixed-dim": "#cdbdff",
+                      "secondary-fixed": "#ffdcc5"
+              },
+              "borderRadius": {
+                      "DEFAULT": "1rem",
+                      "lg": "2rem",
+                      "xl": "3rem",
+                      "full": "9999px"
+              },
+              "spacing": {
+                      "lg": "32px",
+                      "xl": "48px",
+                      "md": "24px",
+                      "sm": "12px",
+                      "xs": "8px",
+                      "base": "4px",
+                      "layout_split": "30% 70%"
+              },
+              "fontFamily": {
+                      "body-md": [
+                              "Roboto Flex"
+                      ],
+                      "body-lg": [
+                              "Roboto Flex"
+                      ],
+                      "label-sm": [
+                              "Roboto Flex"
+                      ],
+                      "headline-md": [
+                              "Space Grotesk"
+                      ],
+                      "data-mono": [
+                              "Roboto Flex"
+                      ],
+                      "headline-lg": [
+                              "Space Grotesk"
+                      ]
+              },
+              "fontSize": {
+                      "body-md": [
+                              "14px",
+                              {
+                                      "lineHeight": "1.5",
+                                      "fontWeight": "400"
+                              }
+                      ],
+                      "body-lg": [
+                              "18px",
+                              {
+                                      "lineHeight": "1.6",
+                                      "fontWeight": "400"
+                              }
+                      ],
+                      "label-sm": [
+                              "11px",
+                              {
+                                      "lineHeight": "1",
+                                      "fontWeight": "700"
+                              }
+                      ],
+                      "headline-md": [
+                              "28px",
+                              {
+                                      "lineHeight": "1.3",
+                                      "fontWeight": "500"
+                              }
+                      ],
+                      "data-mono": [
+                              "12px",
+                              {
+                                      "lineHeight": "1.4",
+                                      "letterSpacing": "0.05em",
+                                      "fontWeight": "500"
+                              }
+                      ],
+                      "headline-lg": [
+                              "40px",
+                              {
+                                      "lineHeight": "1.2",
+                                      "fontWeight": "600"
+                              }
+                      ]
+              }
+      },
+          },
+        }
+      </script>
+<style>
+        .bloom-primary { box-shadow: 0 0 8px var(--tw-colors-primary); }
+        .bloom-tertiary { box-shadow: 0 0 8px var(--tw-colors-tertiary); }
+      </style>
+</head>
+<body class="bg-background text-on-background font-body-md min-h-screen flex overflow-hidden">
+<!-- SideNavBar -->
+<nav class="hidden md:flex w-[30%] h-full fixed left-0 top-0 border-r border-outline-variant bg-surface-container-low dark:bg-surface-container-low flex flex-col py-lg px-md z-50">
+<!-- Header -->
+<div class="mb-xl">
+<div class="flex items-center gap-sm mb-xs">
+<img alt="User profile in laboratory interface" class="w-10 h-10 rounded-full object-cover border border-outline-variant" data-alt="A macro shot of a sleek, dark metallic laboratory instrument panel with glowing lavender accents. The metallic surface has a micro-texture, and a small circular display shows abstract data patterns. The mood is highly technical, precise, and futuristic, perfectly aligned with a high-end dark-mode science interface." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDWwX8pVPHYLnF9dIcUWUfVM0M2sqeqiyg9QqJc7-zOy41K9Nsl2bPdtHUdLC8e3gQahhSWm1RMf9VjiN5ExhYqWxWFvLve1wpRAGIm74U-cb1taJro4OdphbtzJyKXipsJdbHVm6OuOAtcoALWR_hgGXQkd3HspG421LR1cI4ik5mABbqSmhCSONAvem8vjM_hF-xtMGDSMUFboVgE6Ei1o8BIC6T6c6swEnG1PNHADT8v763pELbpj5M6EYhimWx-oA2KFo5hXlY"/>
+<div>
+<h1 class="font-headline-md text-headline-md font-bold text-primary dark:text-primary tracking-tight">PrimeNode</h1>
+<p class="font-label-sm text-label-sm text-on-surface-variant">Analytical Precision v1.0.4</p>
+</div>
+</div>
+<button class="w-full mt-md bg-primary text-on-primary py-xs px-md rounded-full font-label-sm text-label-sm flex items-center justify-center gap-xs hover:bg-surface-tint transition-colors">
+<span class="material-symbols-outlined" style="font-size: 16px;">add</span>
+                New Analysis
+            </button>
+</div>
+<!-- Main Navigation Tabs -->
+<div class="flex-1 space-y-xs overflow-y-auto pr-sm">
+<p class="font-label-sm text-label-sm text-outline-variant uppercase tracking-wider mb-sm pl-xs">Navigation</p>
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">biotech</span>
+<span class="font-body-md text-body-md">Dashboard</span>
+</a>
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">terminal</span>
+<span class="font-body-md text-body-md">Query Console</span>
+</a>
+<!-- Active Tab -->
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-primary dark:text-primary border-l-4 border-primary bg-primary-container/10 scale-[0.98] transition-transform duration-150" href="#">
+<span class="material-symbols-outlined">grid_view</span>
+<span class="font-body-md text-body-md font-bold">Discovery Canvas</span>
+</a>
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">history</span>
+<span class="font-body-md text-body-md">Node History</span>
+</a>
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">settings</span>
+<span class="font-body-md text-body-md">Laboratory Settings</span>
+</a>
+</div>
+<!-- Footer Tabs -->
+<div class="mt-auto pt-md border-t border-outline-variant space-y-xs">
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">memory</span>
+<span class="font-body-md text-body-md">System Status</span>
+</a>
+<a class="flex items-center gap-sm px-sm py-sm rounded-lg text-on-surface-variant dark:text-on-surface-variant hover:bg-surface-container-high dark:hover:bg-surface-container-high hover:text-primary transition-all duration-200" href="#">
+<span class="material-symbols-outlined">menu_book</span>
+<span class="font-body-md text-body-md">Documentation</span>
+</a>
+</div>
+</nav>
+<!-- Main Content Area (70% split) -->
+<main class="ml-[30%] w-[70%] flex flex-col h-screen">
+<!-- TopAppBar -->
+<header class="docked full-width top-0 sticky z-40 bg-surface-dim dark:bg-surface-dim border-b border-outline-variant flex justify-between items-center h-16 px-lg">
+<!-- Breadcrumb / Context -->
+<div class="flex items-center gap-sm">
+<span class="font-headline-md text-headline-md text-primary dark:text-primary font-bold">Discovery Canvas</span>
+</div>
+<!-- Actions -->
+<div class="flex items-center gap-md text-on-surface-variant dark:text-on-surface-variant">
+<button class="hover:text-primary dark:hover:text-primary transition-colors focus:ring-1 focus:ring-primary dark:focus:ring-primary rounded-full p-1">
+<span class="material-symbols-outlined">notifications</span>
+</button>
+<button class="hover:text-primary dark:hover:text-primary transition-colors focus:ring-1 focus:ring-primary dark:focus:ring-primary rounded-full p-1">
+<span class="material-symbols-outlined">science</span>
+</button>
+<button class="hover:text-primary dark:hover:text-primary transition-colors focus:ring-1 focus:ring-primary dark:focus:ring-primary rounded-full p-1">
+<span class="material-symbols-outlined">account_circle</span>
+</button>
+</div>
+</header>
+<!-- Canvas Content Area -->
+<div class="flex-1 overflow-y-auto p-lg bg-background">
+<!-- Controls Overlay (Floating or Integrated depending on specific layout intent, here integrated at top for context) -->
+<div class="bg-surface-container rounded-lg p-md mb-lg border border-outline-variant flex flex-col gap-md">
+<div class="flex items-center gap-md w-full">
+<div class="relative w-full max-w-xl">
+<span class="material-symbols-outlined absolute left-4 top-1/2 -translate-y-1/2 text-outline">search</span>
+<div class="w-full bg-surface-container-highest border border-outline-variant rounded-full h-12 flex items-center px-12 focus-within:border-primary focus-within:ring-1 focus-within:ring-primary transition-all">
+<!-- Simulated resolved chip -->
+<div class="bg-primary/20 border border-primary/50 text-primary px-sm py-1 rounded-full flex items-center gap-1 font-data-mono text-data-mono">
+                                Alzheimer's
+                                <span class="material-symbols-outlined text-[14px] cursor-pointer hover:text-primary-fixed">close</span>
+</div>
+<input class="bg-transparent border-none outline-none text-on-surface flex-1 ml-2 font-body-md text-body-md placeholder:text-outline h-full" placeholder="Add Target Node..." type="text"/>
+</div>
+</div>
+</div>
+<div class="h-[1px] w-full bg-outline-variant/30"></div>
+<div class="flex gap-xl items-center">
+<div class="flex-1">
+<div class="flex justify-between mb-2">
+<label class="font-label-sm text-label-sm text-on-surface-variant">Minimum Prediction Score</label>
+<span class="font-data-mono text-data-mono text-primary">85%</span>
+</div>
+<!-- Custom Range Slider visualization -->
+<div class="h-2 bg-surface-container-highest rounded-full w-full relative">
+<div class="absolute left-0 top-0 h-full bg-primary rounded-full w-[85%] bloom-primary"></div>
+<div class="absolute top-1/2 -translate-y-1/2 left-[85%] w-4 h-4 bg-surface-tint rounded-full border-2 border-background shadow-[0_0_8px_rgba(205,189,255,0.5)] cursor-pointer"></div>
+</div>
+</div>
+<div class="flex-1 border-l border-outline-variant/30 pl-xl">
+<label class="font-label-sm text-label-sm text-on-surface-variant block mb-2">Clinical Phase Filter</label>
+<div class="flex gap-2">
+<span class="px-3 py-1 bg-surface-container-highest border border-outline-variant rounded-full font-label-sm text-label-sm text-on-surface-variant cursor-pointer hover:border-primary hover:text-primary transition-colors">Phase I</span>
+<span class="px-3 py-1 bg-surface-container-highest border border-outline-variant rounded-full font-label-sm text-label-sm text-on-surface-variant cursor-pointer hover:border-primary hover:text-primary transition-colors">Phase II</span>
+<span class="px-3 py-1 bg-primary/20 border border-primary text-primary rounded-full font-label-sm text-label-sm cursor-pointer bloom-primary">Phase III</span>
+<span class="px-3 py-1 bg-primary/20 border border-primary text-primary rounded-full font-label-sm text-label-sm cursor-pointer bloom-primary">Approved</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Header for Results -->
+<div class="flex justify-between items-end mb-md">
+<div>
+<h2 class="font-headline-md text-headline-md text-on-surface">Candidate Repurposing Nodes</h2>
+<p class="font-body-md text-body-md text-on-surface-variant">Showing high-confidence matches for Alzheimer's</p>
+</div>
+<div class="flex gap-2">
+<button class="p-2 bg-surface-container-high rounded-lg text-on-surface-variant hover:text-primary border border-outline-variant"><span class="material-symbols-outlined">filter_list</span></button>
+<button class="p-2 bg-surface-container-high rounded-lg text-on-surface-variant hover:text-primary border border-outline-variant"><span class="material-symbols-outlined">sort</span></button>
+</div>
+</div>
+<!-- Masonry Grid -->
+<div class="columns-1 lg:columns-2 gap-md space-y-md">
+<!-- Card 1 -->
+<div class="break-inside-avoid bg-surface-container rounded-lg border border-outline-variant hover:border-primary/50 transition-all duration-300 overflow-hidden flex flex-col group relative">
+<!-- High confidence glow subtle overlay -->
+<div class="absolute top-0 right-0 w-32 h-32 bg-tertiary/5 rounded-full blur-3xl pointer-events-none"></div>
+<div class="p-md flex-1">
+<div class="flex justify-between items-start mb-sm">
+<div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-semibold">Donepezil</h3>
+<span class="inline-block mt-1 px-2 py-[2px] bg-surface-container-highest border border-outline-variant rounded-sm font-label-sm text-label-sm text-on-surface-variant uppercase">Approved</span>
+</div>
+<!-- Match Score Ring -->
+<div class="relative w-12 h-12 flex items-center justify-center">
+<svg class="w-full h-full transform -rotate-90" viewbox="0 0 36 36">
+<path class="text-surface-container-highest" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-width="3"></path>
+<path class="text-tertiary bloom-tertiary" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-dasharray="94, 100" stroke-linecap="round" stroke-width="3"></path>
+</svg>
+<span class="absolute font-data-mono text-data-mono text-tertiary font-bold">94%</span>
+</div>
+</div>
+<div class="h-[1px] w-full bg-outline-variant/30 my-md"></div>
+<p class="font-label-sm text-label-sm text-outline-variant uppercase mb-xs tracking-widest">Mechanism Path</p>
+<!-- MoA Visual Breadcrumbs -->
+<div class="flex items-center gap-xs font-data-mono text-data-mono">
+<div class="flex items-center gap-2">
+<div class="w-2 h-2 rounded-full bg-primary bloom-primary"></div>
+<span class="text-primary text-[11px]">Alzheimer's</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface-variant"></div>
+<span class="text-on-surface-variant text-[11px]">AChE</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface"></div>
+<span class="text-on-surface text-[11px]">Donepezil</span>
+</div>
+</div>
+</div>
+<button class="w-full bg-primary/10 hover:bg-primary/20 text-primary py-sm font-label-sm text-label-sm border-t border-primary/20 transition-colors uppercase tracking-wider flex items-center justify-center gap-2">
+                        View Repurposing Rationale
+                        <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
+</button>
+</div>
+<!-- Card 2 -->
+<div class="break-inside-avoid bg-surface-container rounded-lg border border-outline-variant hover:border-primary/50 transition-all duration-300 overflow-hidden flex flex-col group relative">
+<div class="p-md flex-1">
+<div class="flex justify-between items-start mb-sm">
+<div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-semibold">Memantine</h3>
+<span class="inline-block mt-1 px-2 py-[2px] bg-surface-container-highest border border-outline-variant rounded-sm font-label-sm text-label-sm text-on-surface-variant uppercase">Approved</span>
+</div>
+<!-- Match Score Ring -->
+<div class="relative w-12 h-12 flex items-center justify-center">
+<svg class="w-full h-full transform -rotate-90" viewbox="0 0 36 36">
+<path class="text-surface-container-highest" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-width="3"></path>
+<path class="text-tertiary bloom-tertiary" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-dasharray="88, 100" stroke-linecap="round" stroke-width="3"></path>
+</svg>
+<span class="absolute font-data-mono text-data-mono text-tertiary font-bold">88%</span>
+</div>
+</div>
+<div class="h-[1px] w-full bg-outline-variant/30 my-md"></div>
+<p class="font-label-sm text-label-sm text-outline-variant uppercase mb-xs tracking-widest">Mechanism Path</p>
+<!-- MoA Visual Breadcrumbs -->
+<div class="flex items-center gap-xs font-data-mono text-data-mono flex-wrap">
+<div class="flex items-center gap-2">
+<div class="w-2 h-2 rounded-full bg-primary bloom-primary"></div>
+<span class="text-primary text-[11px]">Alzheimer's</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface-variant"></div>
+<span class="text-on-surface-variant text-[11px]">NMDA</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface"></div>
+<span class="text-on-surface text-[11px]">Memantine</span>
+</div>
+</div>
+</div>
+<button class="w-full bg-primary/10 hover:bg-primary/20 text-primary py-sm font-label-sm text-label-sm border-t border-primary/20 transition-colors uppercase tracking-wider flex items-center justify-center gap-2">
+                        View Repurposing Rationale
+                        <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
+</button>
+</div>
+<!-- Card 3 (Phase III, lower score, orange highlight) -->
+<div class="break-inside-avoid bg-surface-container rounded-lg border border-outline-variant hover:border-secondary/50 transition-all duration-300 overflow-hidden flex flex-col group relative">
+<div class="p-md flex-1">
+<div class="flex justify-between items-start mb-sm">
+<div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-semibold">Lecanemab</h3>
+<span class="inline-block mt-1 px-2 py-[2px] bg-primary/10 border border-primary/30 rounded-sm font-label-sm text-label-sm text-primary uppercase">Phase III</span>
+</div>
+<!-- Match Score Ring - Orange -->
+<div class="relative w-12 h-12 flex items-center justify-center">
+<svg class="w-full h-full transform -rotate-90" viewbox="0 0 36 36">
+<path class="text-surface-container-highest" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-width="3"></path>
+<path class="text-secondary" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="currentColor" stroke-dasharray="72, 100" stroke-linecap="round" stroke-width="3" style="filter: drop-shadow(0 0 4px var(--tw-colors-secondary));"></path>
+</svg>
+<span class="absolute font-data-mono text-data-mono text-secondary font-bold">72%</span>
+</div>
+</div>
+<div class="h-[1px] w-full bg-outline-variant/30 my-md"></div>
+<p class="font-label-sm text-label-sm text-outline-variant uppercase mb-xs tracking-widest">Mechanism Path</p>
+<!-- MoA Visual Breadcrumbs -->
+<div class="flex items-center gap-xs font-data-mono text-data-mono flex-wrap">
+<div class="flex items-center gap-2">
+<div class="w-2 h-2 rounded-full bg-primary bloom-primary"></div>
+<span class="text-primary text-[11px]">Alzheimer's</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface-variant"></div>
+<span class="text-on-surface-variant text-[11px]">Aβ</span>
+</div>
+<div class="h-[1px] w-4 bg-primary/50"></div>
+<div class="flex items-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-on-surface"></div>
+<span class="text-on-surface text-[11px]">Lecanemab</span>
+</div>
+</div>
+</div>
+<button class="w-full bg-primary/10 hover:bg-primary/20 text-primary py-sm font-label-sm text-label-sm border-t border-primary/20 transition-colors uppercase tracking-wider flex items-center justify-center gap-2">
+                        View Repurposing Rationale
+                        <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
+</button>
+</div>
+</div>
+<div class="h-xl"></div> <!-- Bottom padding -->
+</div>
+</main>
+</body></html>

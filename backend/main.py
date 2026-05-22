@@ -58,20 +58,26 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         self.node_embedding = nn.Embedding(num_nodes, hidden_dim)
         self.type_embedding = nn.Embedding(num_types, hidden_dim)
 
+        # RGCN encoder with 3 residual layers for deeper feature learning.
         self.gcn_in = RGCNConv(hidden_dim, hidden_dim, num_relations=3)
-        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(1)])
+        self.res_layers = nn.ModuleList([ResidualRGCNLayer(hidden_dim, num_relations=3, dropout=dropout) for _ in range(3)])
         self.gcn_out = RGCNConv(hidden_dim, embedding_dim, num_relations=3)
 
+        # Deeper link predictor: src, dst, elementwise product, and cosine similarity.
         self.link_predictor = nn.Sequential(
-            nn.Linear(embedding_dim * 3, embedding_dim),
+            nn.Linear(embedding_dim * 3 + 1, embedding_dim * 2),
             nn.ReLU(),
-            nn.BatchNorm1d(embedding_dim),
+            nn.BatchNorm1d(embedding_dim * 2),
             nn.Dropout(dropout),
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(embedding_dim, 1),
         )
         
-        self.degree_alpha = nn.Parameter(torch.tensor(0.1))
-        self.degree_beta = nn.Parameter(torch.tensor(0.1))
+        # Learnable additive degree penalty — subtracts from score, does NOT divide.
+        self.degree_alpha = nn.Parameter(torch.tensor(0.05))
+        self.degree_beta = nn.Parameter(torch.tensor(0.05))
 
     def encode(self, node_type_ids: torch.Tensor, adjs: List[torch.Tensor]) -> torch.Tensor:
         idx = torch.arange(len(node_type_ids), device=node_type_ids.device)
@@ -93,13 +99,17 @@ class PrimeKGDrugRepurposingGNN(nn.Module):
         src_deg = degrees[src_idx].clamp(min=1).float()
         dst_deg = degrees[dst_idx].clamp(min=1).float()
 
-        features = torch.cat([src_z, dst_z, src_z * dst_z], dim=-1)
+        # Cosine similarity as additional disease-specificity signal
+        cos_sim = F.cosine_similarity(src_z, dst_z, dim=-1).unsqueeze(-1)
+
+        features = torch.cat([src_z, dst_z, src_z * dst_z, cos_sim], dim=-1)
         mlp_score = self.link_predictor(features).squeeze(-1)
         
-        base_score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
-        normalized_score = base_score / (torch.sqrt(src_deg) * torch.sqrt(dst_deg) + 1e-8)
+        # Soft additive degree penalty — penalizes high-degree hubs WITHOUT
+        # collapsing the score range.
+        score = mlp_score - F.relu(self.degree_alpha) * torch.log(src_deg) - F.relu(self.degree_beta) * torch.log(dst_deg)
         
-        return normalized_score
+        return score
 
 
 # ─── App Setup ────────────────────────────────────────────────────────
@@ -141,6 +151,8 @@ therapeutic_by_disease = {}
 drug_prior_centered = {}
 prior_sampled_diseases = 0
 adj_list_1hop = {}  # For explainability
+drug_protein_targets = {}  # drug_node_idx -> list of {protein_id, protein_name, relation}
+disease_protein_targets = {}  # disease_node_idx -> set of protein names (inferred via drugs)
 
 DRUG_CATEGORIES = {
     "immunosuppressants": {"tacrolimus", "cyclosporine", "mycophenolate", "sirolimus", "azathioprine", "methotrexate", "dexamethasone", "prednisone"},
@@ -450,6 +462,23 @@ def load_models():
         print(f"Disease catalog size: {len(disease_catalog)}")
         print(f"Drug prior map size: {len(drug_prior_centered)} (sampled diseases={prior_sampled_diseases})")
         print(f"Graph loaded for explainability: {len(adj_list_1hop)} nodes")
+
+        # Load drug-protein target map for biological rationale.
+        raw_targets = metadata.get('drug_protein_targets', {})
+        for k, v in raw_targets.items():
+            drug_protein_targets[int(k)] = v
+        print(f"Drug-protein targets loaded: {len(drug_protein_targets)} drugs")
+
+        # Build disease -> protein map by aggregating targets of known therapeutic drugs.
+        all_keys = metadata['all_keys']
+        for disease_idx, drug_set in therapeutic_by_disease.items():
+            proteins = set()
+            for drug_idx in drug_set:
+                for target in drug_protein_targets.get(int(drug_idx), []):
+                    proteins.add(target.get('protein_name', ''))
+            if proteins:
+                disease_protein_targets[int(disease_idx)] = proteins
+        print(f"Disease-protein targets inferred: {len(disease_protein_targets)} diseases")
     except Exception as e:
         print(f"Error loading models: {e}")
         import traceback
@@ -669,8 +698,12 @@ def predict(req: PredictionRequest):
         prior_np = prior_t.cpu().numpy()
         specificity_np = specificity_t.cpu().numpy()
 
-    # Protein targets for a small curated set of diseases.
-    # Use exact normalized disease-name matching only (no broad substring fallback).
+    # ── Build disease protein targets from PrimeKG graph ──
+    # Instead of a hardcoded lookup, we derive protein targets from the
+    # drugs that are known to treat this disease.
+    disease_proteins_set = disease_protein_targets.get(target_disease_idx, set())
+
+    # Also keep the curated fallback for diseases not well-covered in PrimeKG
     DISEASE_TARGETS_BY_NAME = {
         normalize_text("cancer"): {"TP53": "1TUP", "EGFR": "1M17", "BCR_ABL": "1IEP"},
         normalize_text("leukemia"): {"CD20": "2H7W", "BCL2": "2XA0"},
@@ -726,6 +759,62 @@ def predict(req: PredictionRequest):
         ligand_path = f"../data/ligands/{safe_drug_name}.sdf"
         ligand_url = f"{BASE_URL}/data/ligands/{safe_drug_name}.sdf" if os.path.exists(ligand_path) else None
 
+        # ── Biological Rationale ──
+        # For each recommended drug, explain WHY it might work for this disease
+        # by finding shared protein targets between the drug and the disease.
+        drug_targets_list = drug_protein_targets.get(int(drug_idx), [])
+
+        # Separate targets by relationship type
+        direct_targets = [t for t in drug_targets_list if t.get('relation') == 'target']
+        enzymes = [t for t in drug_targets_list if t.get('relation') == 'enzyme']
+        transporters = [t for t in drug_targets_list if t.get('relation') == 'transporter']
+        carriers = [t for t in drug_targets_list if t.get('relation') == 'carrier']
+
+        # Find proteins shared between this drug's targets and the disease's associated proteins
+        drug_protein_names = {t.get('protein_name', '') for t in drug_targets_list}
+        shared_proteins = drug_protein_names.intersection(disease_proteins_set)
+
+        # Build the rationale explanation
+        rationale_parts = []
+        if shared_proteins:
+            shared_list = sorted(shared_proteins)[:5]  # Top 5 shared proteins
+            rationale_parts.append(
+                f"Shares {len(shared_proteins)} protein target(s) with known treatments for {target_disease_name}: "
+                + ", ".join(shared_list)
+            )
+
+        if direct_targets:
+            target_names = [t.get('protein_name', '?') for t in direct_targets[:5]]
+            rationale_parts.append(f"Directly targets: {', '.join(target_names)}")
+
+        if enzymes:
+            enzyme_names = [t.get('protein_name', '?') for t in enzymes[:3]]
+            rationale_parts.append(f"Metabolized by: {', '.join(enzyme_names)}")
+
+        if not rationale_parts:
+            rationale_parts.append(
+                "No direct protein target overlap found with known treatments. "
+                "This is a novel GNN-predicted link based on graph structure."
+            )
+
+        rationale = " | ".join(rationale_parts)
+
+        # Confidence assessment based on biological evidence
+        evidence_score = 0
+        if shared_proteins:
+            evidence_score += min(len(shared_proteins) * 2, 6)  # Up to 6 pts for shared targets
+        if direct_targets:
+            evidence_score += 2  # Known mechanism
+        if drug_targets_list:
+            evidence_score += 1  # Any known targets at all
+
+        if evidence_score >= 6:
+            biological_confidence = "high"
+        elif evidence_score >= 3:
+            biological_confidence = "medium"
+        else:
+            biological_confidence = "low"
+
         results.append({
             "drug_node_idx": drug_idx,
             "drug_name": drug_name,
@@ -735,7 +824,16 @@ def predict(req: PredictionRequest):
             "specificity": round(specificity_component, 4),
             "degree": int(drug_degree),
             "degree_bucket": degree_bucket,
-            "ligand_url": ligand_url
+            "ligand_url": ligand_url,
+            "rationale": rationale,
+            "biological_confidence": biological_confidence,
+            "protein_targets": {
+                "direct_targets": [t.get('protein_name', '') for t in direct_targets[:5]],
+                "enzymes": [t.get('protein_name', '') for t in enzymes[:3]],
+                "transporters": [t.get('protein_name', '') for t in transporters[:3]],
+                "carriers": [t.get('protein_name', '') for t in carriers[:3]],
+            },
+            "shared_disease_proteins": sorted(shared_proteins)[:5] if shared_proteins else [],
         })
 
     return {
@@ -746,6 +844,7 @@ def predict(req: PredictionRequest):
         "match_type": match_type,
         "match_score": round(float(match_score), 4),
         "targets": targets,
+        "disease_associated_proteins": sorted(disease_proteins_set)[:20] if disease_proteins_set else [],
         "predictions": results,
         "therapeutic_drug_count": len(base_candidate_drug_nodes),
         "candidate_count_after_filters": len(candidate_drug_nodes),
@@ -771,3 +870,4 @@ def predict(req: PredictionRequest):
             "prior_sampled_diseases": int(prior_sampled_diseases),
         },
     }
+

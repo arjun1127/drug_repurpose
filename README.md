@@ -9,9 +9,17 @@ Backend/frontend exist for serving and visualization, but the core work is:
 - hybrid ranking + calibration losses
 - explicit hub-bias diagnostics and mitigation
 
+
 ## End-to-End Architecture
 ```text
-PrimeKG CSV
+PrimeKG CSV 
+  ->Disease
+ ├── associated genes
+ ├── symptoms
+ ├── pathways
+ ├── drugs
+ └── anatomical regions
+ 
   -> column normalization + entity mapping
   -> extract drug-disease relations by type
       positives: indication, off-label use
@@ -289,13 +297,20 @@ Predictions can be inspected via the **"Explain"** action. The system performs a
 - **Length-3 (L3):** Two-hop connections (e.g., `Drug -> Gene -> Phenotype -> Disease`).
 - These paths provide a biological hypothesis for *why* the GNN predicts a therapeutic relationship.
 
-### 2. Biological Filtering
+### 2. Target Protein Rationale Mapping
+To provide immediate context directly alongside predictions, the system uses the PrimeKG graph to trace explicit drug-to-protein targets:
+- We map all `drug_protein` edges (target, enzyme, transporter, carrier) for every drug.
+- We map disease-to-protein targets by inferring from known approved treatments.
+- The `/predict` endpoint dynamically generates plain-text rationales (e.g., "Shares X protein target(s) with known treatments", "Metabolized by Y").
+- A standalone script `add_drug_targets_to_metadata.py` extracts these targets and injects them into the model's metadata without requiring full GNN retraining.
+
+### 3. Biological Filtering
 Users can apply filters to exclude specific pharmacological classes that may be irrelevant to their search:
 - **Exclude Immunosuppressants:** Removes drugs like Tacrolimus or Cyclosporine from candidates.
 - **Exclude Topical-only drugs:** Removes drugs intended only for skin/surface application.
 - Implementation uses a dictionary-based mapping (`DRUG_CATEGORIES`) in the backend to ensure precise filtering.
 
-### 3. Orphan Node Penalty Cap
+### 4. Orphan Node Penalty Cap
 Highly connected "hub" nodes often dominate GNN predictions. While the model includes degree-normalization, some users may want more or less penalty. 
 - The **Orphan Node Penalty Cap** slider allows dynamic adjustment of the degree clamping threshold (`orphan_cap`) during inference. 
 - Higher values reduce the relative penalty for high-degree drugs, while lower values prioritize rarer "orphan" drugs.
